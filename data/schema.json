@@ -1,0 +1,133 @@
+[
+  {
+    "database": "api-dev",
+    "index": "motac_destinations",
+    "nodes": {
+      "table": "destination",
+      "schema": "public",
+      "columns": [
+        "id",
+        "title",
+        "address",
+        "happening_start_date",
+        "happening_end_date"
+      ],
+      "children": [
+        {
+          "table": "area",
+          "schema": "public",
+          "columns": [
+            "name"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "children": [
+            {
+              "table": "city",
+              "schema": "public",
+              "columns": [
+                "name"
+              ],
+              "relationship": {
+                "variant": "object",
+                "type": "one_to_one"
+              }
+            }
+          ],
+          "transform": {
+            "move": {
+              "column": "name",
+              "destination": "$root.area_name"
+            },
+            "children": [
+              {
+                "move": {
+                  "column": "name",
+                  "destination": "$root.city_name"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "table": "file",
+          "schema": "public",
+          "columns": [
+            "path"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "transform": {
+            "rename": {
+              "path": "banner_image_url"
+            },
+            "move": {
+              "column": "banner_image_url",
+              "destination": "$root.banner_image_url"
+            }
+          }
+        },
+        {
+          "table": "destination_category",
+          "schema": "public",
+          "columns": [
+            "name"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "transform": {
+            "rename": {
+              "name": "category"
+            },
+            "move": {
+              "column": "category",
+              "destination": "$root.category"
+            }
+          }
+        },
+        {
+          "table": "destination_recommendation_tag",
+          "schema": "public",
+          "columns": [
+              "id"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_many"
+          },
+          "children": [
+            {
+              "table": "recommendation_tag",
+              "schema": "public",
+              "columns": [
+                "name"
+              ],
+              "relationship": {
+                "variant": "object",
+                "type": "one_to_one"
+              },
+              "transform": {
+                "move": {
+                  "column": "name",
+                  "destination": "$root.tags"
+                }
+              }
+            }
+          ],
+          "transform": {
+            "move": {
+              "column": "id",
+              "destination": "$root.tags"
+            }
+          }
+        }
+      ]
+    }
+  }
+]

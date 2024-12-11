@@ -1,17 +1,38 @@
 #! /bin/sh
 
+# Wait for dependencies
 ./wait-for-it.sh $PG_HOST:$PG_PORT -t 60
-
-./wait-for-it.sh $ELASTICSEARCH_HOST:$ELASTICSEARCH_PORT -t 60
-
+# ./wait-for-it.sh $ELASTICSEARCH_HOST:$ELASTICSEARCH_PORT -t 60
 ./wait-for-it.sh $REDIS_HOST:$REDIS_PORT -t 60
 
-EXAMPLE_DIR="examples/${EXAMPLE_NAME:-airbnb}"
+# Ensure /data directory exists
+mkdir -p /data
 
-python $EXAMPLE_DIR/schema.py --config $EXAMPLE_DIR/schema.json
+# Download schema.json from URL
+if [ -n "$SCHEMA_URL" ]; then
+  echo "Downloading schema.json from $SCHEMA_URL"
+  curl -sSf -o /data/schema.json "$SCHEMA_URL" || {
+    echo "Error: Failed to download schema.json from $SCHEMA_URL"
+    exit 1
+  }
+fi
 
-python $EXAMPLE_DIR/data.py --config $EXAMPLE_DIR/schema.json
+# Ensure schema file exists
+SCHEMA_FILE=${SCHEMA_FILE:-/data/schema.json}
+if [ ! -f "$SCHEMA_FILE" ]; then
+  echo "Error: Schema file not found at $SCHEMA_FILE"
+  exit 1
+fi
 
-bootstrap --config $EXAMPLE_DIR/schema.json
+# Bootstrap and start pgsync
+echo "Bootstrapping pgsync with schema file: $SCHEMA_FILE"
+bootstrap --config "$SCHEMA_FILE" || {
+  echo "Error: Failed to bootstrap pgsync with $SCHEMA_FILE"
+  exit 1
+}
 
-pgsync --config $EXAMPLE_DIR/schema.json --daemon
+echo "Starting pgsync..."
+pgsync --config "$SCHEMA_FILE" --daemon || {
+  echo "Error: Failed to start pgsync"
+  exit 1
+}
