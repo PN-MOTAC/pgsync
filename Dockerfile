@@ -10,6 +10,12 @@ RUN pip install git+https://github.com/toluaina/pgsync.git
 COPY ./docker/wait-for-it.sh wait-for-it.sh
 COPY ./docker/runserver.sh runserver.sh
 
+# Copy plugins directory into the container
+COPY ./plugins $WORKDIR/plugins
+
 # Set permissions for scripts
 RUN chmod +x wait-for-it.sh
 RUN chmod +x runserver.sh
+
+# Set PYTHONPATH to include the plugins directory
+ENV PYTHONPATH="$WORKDIR"

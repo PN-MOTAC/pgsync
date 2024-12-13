@@ -89,7 +89,20 @@
               "column": "category",
               "destination": "$root.category"
             }
-          }
+          },
+          "children": [
+            {
+              "table": "destination_type",
+              "schema": "public",
+              "columns": [
+                "name"
+              ],
+              "relationship": {
+                "variant": "object",
+                "type": "one_to_one"
+              }
+            }
+          ]
         },
         {
           "table": "destination_recommendation_tag",
@@ -124,6 +137,349 @@
             "move": {
               "column": "id",
               "destination": "$root.tags"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "database": "api-dev",
+    "index": "motac_restaurants",
+    "plugins": ["GeoPoint"],
+    "nodes": {
+      "table": "restaurant_branch",
+      "schema": "public",
+      "columns": [
+        "id",
+        "name",
+        "description",
+        "opening_hours",
+        "closing_hours",
+        "age_limit",
+        "contact_number",
+        "address",
+        "map_link",
+        "latitude",
+        "longitude"
+      ],
+      "children": [
+        {
+          "table": "restaurant",
+          "schema": "public",
+          "columns": [
+            "name",
+            "description"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_many"
+          }
+        },
+        {
+          "table": "priority",
+          "schema": "public",
+          "columns": [
+            "name",
+            "rank"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          }
+        },
+        {
+          "table": "area",
+          "schema": "public",
+          "columns": [
+            "name"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "children": [
+            {
+              "table": "city",
+              "schema": "public",
+              "columns": [
+                "name"
+              ],
+              "relationship": {
+                "variant": "object",
+                "type": "one_to_one"
+              }
+            }
+          ],
+          "transform": {
+            "move": {
+              "column": "name",
+              "destination": "$root.area_name"
+            },
+            "children": [
+              {
+                "move": {
+                  "column": "name",
+                  "destination": "$root.city_name"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "table": "file",
+          "schema": "public",
+          "columns": [
+            "path"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "transform": {
+            "rename": {
+              "path": "banner_image_url"
+            },
+            "move": {
+              "column": "banner_image_url",
+              "destination": "$root.banner_image_url"
+            }
+          }
+        },
+        {
+          "table": "restaurant_branch_category",
+          "schema": "public",
+          "columns": [
+            "name"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "transform": {
+            "rename": {
+              "name": "category"
+            },
+            "move": {
+              "column": "category",
+              "destination": "$root.category"
+            }
+          }
+        },
+        {
+          "table": "restaurant_branch_tag_pivot",
+          "schema": "public",
+          "columns": [
+              "id"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_many"
+          },
+          "children": [
+            {
+              "table": "restaurant_branch_tag",
+              "schema": "public",
+              "columns": [
+                "name"
+              ],
+              "relationship": {
+                "variant": "object",
+                "type": "one_to_one"
+              },
+              "transform": {
+                "move": {
+                  "column": "name",
+                  "destination": "$root.tags"
+                }
+              }
+            }
+          ],
+          "transform": {
+            "move": {
+              "column": "id",
+              "destination": "$root.tags"
+            }
+          }
+        }
+      ],
+      "transform": {
+        "mapping": {
+          "point": {
+            "type": "geo_point"
+          }
+        }
+      }
+    }
+  },
+  {
+    "database": "api-dev",
+    "index": "motac_trips",
+    "nodes": {
+      "table": "trip",
+      "schema": "public",
+      "columns": [
+        "id",
+        "name",
+        "user_id",
+        "start_date"
+      ],
+      "children": [
+        {
+          "table": "file",
+          "schema": "public",
+          "columns": [
+            "path"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "transform": {
+            "rename": {
+              "path": "banner_image_url"
+            },
+            "move": {
+              "column": "banner_image_url",
+              "destination": "$root.banner_image_url"
+            }
+          }
+        },
+        {
+          "table": "trip_day",
+          "schema": "public",
+          "columns": [
+            "id",
+            "title",
+            "day_number"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "children":[
+            {
+              "table": "trip_destination",
+              "schema": "public",
+              "columns": [
+                  "destination_id",
+                  "trip_day_id"
+              ],
+              "relationship": {
+                "variant": "object",
+                "type": "one_to_many"
+              },
+              "children": [
+                {
+                  "table": "destination",
+                  "schema": "public",
+                  "columns": [
+                    "id",
+                    "title",
+                    "latitude",
+                    "longitude"
+                  ],
+                  "relationship": {
+                    "variant": "object",
+                    "type": "one_to_one"
+                  },
+                  "children": [
+                    {
+                      "table": "area",
+                      "schema": "public",
+                      "columns": [
+                        "name"
+                      ],
+                      "relationship": {
+                        "variant": "object",
+                        "type": "one_to_one"
+                      },
+                      "children": [
+                        {
+                          "table": "city",
+                          "schema": "public",
+                          "columns": [
+                            "name"
+                          ],
+                          "relationship": {
+                            "variant": "object",
+                            "type": "one_to_one"
+                          }
+                        }
+                      ],
+                      "transform": {
+                        "move": {
+                          "column": "name",
+                          "destination": "$root.area_name"
+                        },
+                        "children": [
+                          {
+                            "move": {
+                              "column": "name",
+                              "destination": "$root.city_name"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "table": "file",
+                      "schema": "public",
+                      "columns": [
+                        "path"
+                      ],
+                      "relationship": {
+                        "variant": "object",
+                        "type": "one_to_one"
+                      },
+                      "transform": {
+                        "rename": {
+                          "path": "banner_image_url"
+                        },
+                        "move": {
+                          "column": "banner_image_url",
+                          "destination": "$root.banner_image_url"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "database": "api-dev",
+    "index": "motac_guides",
+    "nodes": {
+      "table": "guide",
+      "schema": "public",
+      "columns": [
+        "id",
+        "name",
+        "link"
+      ],
+      "children": [
+        {
+          "table": "file",
+          "schema": "public",
+          "columns": [
+            "path"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          },
+          "transform": {
+            "rename": {
+              "path": "banner_image_url"
+            },
+            "move": {
+              "column": "banner_image_url",
+              "destination": "$root.banner_image_url"
             }
           }
         }
