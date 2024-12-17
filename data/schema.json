@@ -321,10 +321,20 @@
       "columns": [
         "id",
         "name",
-        "user_id",
         "start_date"
       ],
       "children": [
+        {
+          "table": "user",
+          "schema": "public",
+          "columns": [
+            "display_id"
+          ],
+          "relationship": {
+            "variant": "object",
+            "type": "one_to_one"
+          }
+        },
         {
           "table": "file",
           "schema": "public",

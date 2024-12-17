@@ -19,5 +19,5 @@ COPY ./plugins $WORKDIR/plugins
 RUN chmod +x wait-for-it.sh
 RUN chmod +x runserver.sh
 
-# Set PYTHONPATH to point to the plugins folder
-ENV PYTHONPATH="$WORKDIR/plugins"
+# Set PYTHONPATH to point to the parent directory of the plugins folder
+ENV PYTHONPATH="$WORKDIR"
