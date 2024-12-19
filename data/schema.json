@@ -2,6 +2,7 @@
   {
     "database": "api-dev",
     "index": "motac_destinations",
+    "plugins": ["GeoPoint"],
     "nodes": {
       "table": "destination",
       "schema": "public",
@@ -10,7 +11,9 @@
         "title",
         "address",
         "happening_start_date",
-        "happening_end_date"
+        "happening_end_date",
+        "latitude",
+        "longitude"
       ],
       "children": [
         {
@@ -140,7 +143,14 @@
             }
           }
         }
-      ]
+      ],
+      "transform": {
+        "mapping": {
+          "point": {
+            "type": "geo_point"
+          }
+        }
+      }
     }
   },
   {
