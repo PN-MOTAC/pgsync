@@ -178,6 +178,7 @@
           "table": "restaurant",
           "schema": "public",
           "columns": [
+            "id",
             "name",
             "description"
           ],
@@ -331,7 +332,8 @@
       "columns": [
         "id",
         "name",
-        "start_date"
+        "start_date",
+        "is_recommended"
       ],
       "children": [
         {
