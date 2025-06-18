@@ -8,9 +8,11 @@ import pprint
 import re
 import select
 import sys
+import threading
 import time
 import typing as t
 from collections import defaultdict
+from pathlib import Path
 
 import click
 import sqlalchemy as sa
@@ -70,6 +72,7 @@ class Sync(Base, metaclass=Singleton):
         verbose: bool = False,
         validate: bool = True,
         repl_slots: bool = True,
+        polling: bool = False,
         num_workers: int = 1,
         producer: bool = True,
         consumer: bool = True,
@@ -103,15 +106,16 @@ class Sync(Base, metaclass=Singleton):
         self.redis: RedisQueue = RedisQueue(self.__name)
         self.tree: Tree = Tree(self.models, nodes=self.nodes)
         if validate:
-            self.validate(repl_slots=repl_slots)
+            self.validate(repl_slots=repl_slots, polling=polling)
             self.create_setting()
         if self.plugins:
             self._plugins: Plugins = Plugins("plugins", self.plugins)
         self.query_builder: QueryBuilder = QueryBuilder(verbose=verbose)
         self.count: dict = dict(xlog=0, db=0, redis=0)
         self.tasks: t.List[asyncio.Task] = []
+        self.lock = threading.Lock()
 
-    def validate(self, repl_slots: bool = True) -> None:
+    def validate(self, repl_slots: bool = True, polling=False) -> None:
         """Perform all validation right away."""
 
         # ensure v2 compatible schema
@@ -122,57 +126,59 @@ class Sync(Base, metaclass=Singleton):
 
         self.connect()
 
-        max_replication_slots: t.Optional[str] = self.pg_settings(
-            "max_replication_slots"
-        )
-        try:
-            if int(max_replication_slots) < 1:
-                raise TypeError
-        except TypeError:
-            raise RuntimeError(
-                "Ensure there is at least one replication slot defined "
-                "by setting max_replication_slots = 1"
-            )
-
-        wal_level: t.Optional[str] = self.pg_settings("wal_level")
-        if not wal_level or wal_level.lower() != "logical":
-            raise RuntimeError(
-                "Enable logical decoding by setting wal_level = logical"
-            )
-
-        self._can_create_replication_slot("_tmp_")
-
-        rds_logical_replication: t.Optional[str] = self.pg_settings(
-            "rds.logical_replication"
-        )
-        if (
-            rds_logical_replication
-            and rds_logical_replication.lower() == "off"
-        ):
-            raise RDSError("rds.logical_replication is not enabled")
-
         if self.index is None:
             raise ValueError("Index is missing for doc")
 
-        # ensure we have run bootstrap and the replication slot exists
-        if repl_slots and not self.replication_slots(self.__name):
-            raise RuntimeError(
-                f'Replication slot "{self.__name}" does not exist.\n'
-                f'Make sure you have run the "bootstrap" command.'
+        if not polling:
+            max_replication_slots: t.Optional[str] = self.pg_settings(
+                "max_replication_slots"
             )
+            try:
+                if int(max_replication_slots) < 1:
+                    raise TypeError
+            except TypeError:
+                raise RuntimeError(
+                    "Ensure there is at least one replication slot defined "
+                    "by setting max_replication_slots = 1"
+                )
 
-        # ensure the checkpoint dirpath is valid
-        if not os.path.exists(settings.CHECKPOINT_PATH):
-            raise RuntimeError(
-                f"Ensure the checkpoint directory exists "
-                f'"{settings.CHECKPOINT_PATH}" and is readable.'
-            )
+            wal_level: t.Optional[str] = self.pg_settings("wal_level")
+            if not wal_level or wal_level.lower() != "logical":
+                raise RuntimeError(
+                    "Enable logical decoding by setting wal_level = logical"
+                )
 
-        if not os.access(settings.CHECKPOINT_PATH, os.W_OK | os.R_OK):
-            raise RuntimeError(
-                f'Ensure the checkpoint directory "{settings.CHECKPOINT_PATH}"'
-                f" is read/writable"
+            self._can_create_replication_slot("_tmp_")
+
+            rds_logical_replication: t.Optional[str] = self.pg_settings(
+                "rds.logical_replication"
             )
+            if (
+                rds_logical_replication
+                and rds_logical_replication.lower() == "off"
+            ):
+                raise RDSError("rds.logical_replication is not enabled")
+
+            # ensure we have run bootstrap and the replication slot exists
+            if repl_slots and not self.replication_slots(self.__name):
+                raise RuntimeError(
+                    f'Replication slot "{self.__name}" does not exist.\n'
+                    f'Make sure you have run the "bootstrap" command.'
+                )
+
+        if not settings.REDIS_CHECKPOINT:
+            # ensure the checkpoint dirpath is valid
+            if not Path(settings.CHECKPOINT_PATH).exists():
+                raise RuntimeError(
+                    f"Ensure the checkpoint directory exists "
+                    f'"{settings.CHECKPOINT_PATH}" and is readable.'
+                )
+
+            if not os.access(settings.CHECKPOINT_PATH, os.W_OK | os.R_OK):
+                raise RuntimeError(
+                    f'Ensure the checkpoint directory "{settings.CHECKPOINT_PATH}"'
+                    f" is read/writable"
+                )
 
         self.tree.display()
 
@@ -261,80 +267,115 @@ class Sync(Base, metaclass=Singleton):
             routing=self.routing,
         )
 
-    def setup(self) -> None:
+    def setup(self, no_create: bool = False) -> None:
         """Create the database triggers and replication slot."""
 
+        if_not_exists: bool = not no_create
+
         join_queries: bool = settings.JOIN_QUERIES
-        self.teardown(drop_view=False)
 
-        for schema in self.schemas:
-            self.create_function(schema)
-            tables: t.Set = set()
-            # tables with user defined foreign keys
-            user_defined_fkey_tables: dict = {}
+        with self.advisory_lock(
+            self.database, max_retries=None, retry_interval=0.1
+        ):
+            if if_not_exists:
 
-            for node in self.tree.traverse_breadth_first():
-                if node.schema != schema:
-                    continue
-                tables |= set(
-                    [through.table for through in node.relationship.throughs]
-                )
-                tables |= set([node.table])
-                # we also need to bootstrap the base tables
-                tables |= set(node.base_tables)
+                self.teardown(drop_view=False)
 
-                # we want to get both the parent and the child keys here
-                # even though only one of them is the foreign_key.
-                # this is because we define both in the schema but
-                # do not specify which table is the foreign key.
-                columns: list = []
-                if node.relationship.foreign_key.parent:
-                    columns.extend(node.relationship.foreign_key.parent)
-                if node.relationship.foreign_key.child:
-                    columns.extend(node.relationship.foreign_key.child)
-                if columns:
-                    user_defined_fkey_tables.setdefault(node.table, set())
-                    user_defined_fkey_tables[node.table] |= set(columns)
-            if tables:
-                self.create_view(
-                    self.index, schema, tables, user_defined_fkey_tables
-                )
-                self.create_triggers(
-                    schema, tables=tables, join_queries=join_queries
-                )
-        self.create_replication_slot(self.__name)
+            for schema in self.schemas:
+                # TODO: move if_not_exists to the function
+                if if_not_exists or not self.function_exists(schema):
+
+                    self.create_function(schema)
+
+                tables: t.Set = set()
+                # tables with user defined foreign keys
+                user_defined_fkey_tables: dict = {}
+
+                for node in self.tree.traverse_breadth_first():
+                    if node.schema != schema:
+                        continue
+                    tables |= set(
+                        [
+                            through.table
+                            for through in node.relationship.throughs
+                        ]
+                    )
+                    tables |= set([node.table])
+                    # we also need to bootstrap the base tables
+                    tables |= set(node.base_tables)
+
+                    # we want to get both the parent and the child keys here
+                    # even though only one of them is the foreign_key.
+                    # this is because we define both in the schema but
+                    # do not specify which table is the foreign key.
+                    columns: list = []
+                    if node.relationship.foreign_key.parent:
+                        columns.extend(node.relationship.foreign_key.parent)
+                    if node.relationship.foreign_key.child:
+                        columns.extend(node.relationship.foreign_key.child)
+                    if columns:
+                        user_defined_fkey_tables.setdefault(node.table, set())
+                        user_defined_fkey_tables[node.table] |= set(columns)
+                if tables:
+                    if if_not_exists or not self.view_exists(
+                        MATERIALIZED_VIEW, schema
+                    ):
+
+                        self.create_view(
+                            self.index,
+                            schema,
+                            tables,
+                            user_defined_fkey_tables,
+                        )
+
+                    self.create_triggers(
+                        schema,
+                        tables=tables,
+                        join_queries=join_queries,
+                        if_not_exists=if_not_exists,
+                    )
+
+            if if_not_exists or not self.replication_slots(self.__name):
+
+                self.create_replication_slot(self.__name)
 
     def teardown(self, drop_view: bool = True) -> None:
         """Drop the database triggers and replication slot."""
 
         join_queries: bool = settings.JOIN_QUERIES
 
-        try:
-            os.unlink(self._checkpoint_file)
-        except (OSError, FileNotFoundError):
-            logger.warning(
-                f"Checkpoint file not found: {self._checkpoint_file}"
-            )
-
-        self.redis.delete()
-
-        for schema in self.schemas:
-            tables: t.Set = set()
-            for node in self.tree.traverse_breadth_first():
-                tables |= set(
-                    [through.table for through in node.relationship.throughs]
+        with self.advisory_lock(
+            self.database, max_retries=None, retry_interval=0.1
+        ):
+            try:
+                os.unlink(self._checkpoint_file)
+            except (OSError, FileNotFoundError):
+                logger.warning(
+                    f"Checkpoint file not found: {self._checkpoint_file}"
                 )
-                tables |= set([node.table])
-                # we also need to teardown the base tables
-                tables |= set(node.base_tables)
-            self.drop_triggers(
-                schema=schema, tables=tables, join_queries=join_queries
-            )
-            if drop_view:
-                self.drop_view(schema)
-                self.drop_function(schema)
 
-        self.drop_replication_slot(self.__name)
+            self.redis.delete()
+
+            for schema in self.schemas:
+                tables: t.Set = set()
+                for node in self.tree.traverse_breadth_first():
+                    tables |= set(
+                        [
+                            through.table
+                            for through in node.relationship.throughs
+                        ]
+                    )
+                    tables |= set([node.table])
+                    # we also need to teardown the base tables
+                    tables |= set(node.base_tables)
+                self.drop_triggers(
+                    schema=schema, tables=tables, join_queries=join_queries
+                )
+                if drop_view:
+                    self.drop_view(schema)
+                    self.drop_function(schema)
+
+            self.drop_replication_slot(self.__name)
 
     def get_doc_id(self, primary_keys: t.List[str], table: str) -> str:
         """
@@ -449,7 +490,8 @@ class Sync(Base, metaclass=Singleton):
                 upto_nchanges=upto_nchanges,
                 upto_lsn=upto_lsn,
             )
-            self.count["xlog"] += len(rows)
+            with self.lock:
+                self.count["xlog"] += len(rows)
 
     def _root_primary_key_resolver(
         self, node: Node, payload: Payload, filters: list
@@ -1033,9 +1075,25 @@ class Sync(Base, metaclass=Singleton):
         :return: The current checkpoint value.
         :rtype: int
         """
-        if os.path.exists(self._checkpoint_file):
-            with open(self._checkpoint_file, "r") as fp:
-                self._checkpoint: int = int(fp.read().split()[0])
+        raw: t.Optional[str]
+        if settings.REDIS_CHECKPOINT:
+            raw = self.redis.get_meta(default={}).get("checkpoint")
+        else:
+            path = Path(self._checkpoint_file)
+            raw = (
+                path.read_text(encoding="utf-8").split()[0]
+                if path.exists()
+                else None
+            )
+
+        if raw is None:
+            return None
+
+        try:
+            self._checkpoint = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"Corrupt checkpoint value: {raw!r}") from exc
+
         return self._checkpoint
 
     @checkpoint.setter
@@ -1045,19 +1103,27 @@ class Sync(Base, metaclass=Singleton):
 
         :param value: The new checkpoint value.
         :type value: Optional[str]
-        :raises ValueError: If the value is None.
+        :raises TypeError: If the value is None.
         """
         if value is None:
-            raise ValueError("Cannot assign a None value to checkpoint")
-        with open(self._checkpoint_file, "w+") as fp:
-            fp.write(f"{value}\n")
-        self._checkpoint: int = value
+            raise TypeError("Cannot assign a None value to checkpoint")
+
+        if settings.REDIS_CHECKPOINT:
+            self.redis.set_meta({"checkpoint": value})
+        else:
+            Path(self._checkpoint_file).write_text(
+                f"{value}\n", encoding="utf-8"
+            )
+
+        # Update in-memory cache last
+        self._checkpoint = value
 
     def _poll_redis(self) -> None:
         payloads: list = self.redis.pop()
         if payloads:
             logger.debug(f"_poll_redis: {payloads}")
-            self.count["redis"] += len(payloads)
+            with self.lock:
+                self.count["redis"] += len(payloads)
             self.refresh_views()
             self.on_publish(
                 list(map(lambda payload: Payload(**payload), payloads))
@@ -1130,7 +1196,15 @@ class Sync(Base, metaclass=Singleton):
                     payloads = []
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
-                    payload = json.loads(notification.payload)
+
+                    try:
+                        payload = json.loads(notification.payload)
+                    except json.JSONDecodeError as e:
+                        logger.exception(
+                            f"Error decoding JSON payload: {e}\n"
+                            f"Payload: {notification.payload}"
+                        )
+                        continue
                     if (
                         payload["indices"]
                         and self.index in payload["indices"]
@@ -1138,7 +1212,8 @@ class Sync(Base, metaclass=Singleton):
                     ):
                         payloads.append(payload)
                         logger.debug(f"poll_db: {payload}")
-                        self.count["db"] += 1
+                        with self.lock:
+                            self.count["db"] += 1
 
     @exception
     def async_poll_db(self) -> None:
@@ -1239,7 +1314,7 @@ class Sync(Base, metaclass=Singleton):
         if txids != set([None]):
             self.checkpoint: int = min(min(txids), self.txid_current) - 1
 
-    def pull(self) -> None:
+    def pull(self, polling: bool = False) -> None:
         """Pull data from db."""
         txmin: int = self.checkpoint
         txmax: int = self.txid_current
@@ -1252,13 +1327,21 @@ class Sync(Base, metaclass=Singleton):
         self.search_client.bulk(
             self.index, self.sync(txmin=txmin, txmax=txmax)
         )
-        # now sync up to txmax to capture everything we may have missed
-        self.logical_slot_changes(
-            txmin=txmin,
-            txmax=txmax,
-            upto_nchanges=upto_nchanges,
-            upto_lsn=upto_lsn,
-        )
+
+        try:
+            # now sync up to txmax to capture everything we may have missed
+            self.logical_slot_changes(
+                txmin=txmin,
+                txmax=txmax,
+                upto_nchanges=upto_nchanges,
+                upto_lsn=upto_lsn,
+            )
+        except Exception as e:
+            # if we are polling, we can just continue
+            if polling:
+                return
+            else:
+                raise
         self.checkpoint: int = txmax or self.txid_current
         self._truncate = True
 
@@ -1496,10 +1579,14 @@ def main(
                 sync.analyze()
 
         elif polling:
+            # In polling mode, the app can run without replication slots or triggers.
+            # However, this is not the preferred mode of operation.
+            # It should be considered a workaround for running on a read-only cluster.
+            kwargs["polling"] = True
             while True:
                 for doc in config_loader(config):
                     sync: Sync = Sync(doc, verbose=verbose, **kwargs)
-                    sync.pull()
+                    sync.pull(polling=True)
                 time.sleep(settings.POLL_INTERVAL)
 
         else:
