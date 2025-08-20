@@ -1,0 +1,24 @@
+name: Build and Push Docker Image to AWS ECR
+
+on:
+  push:
+    branches:
+      - perwira-dev 
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: AWS ECR
+        uses: kciter/aws-ecr-action@v5
+        with:
+          access_key_id: ${{ secrets.PW_AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.PW_AWS_SECRET_ACCESS_KEY }}
+          account_id: ${{ secrets.PW_AWS_ACCOUNT_ID }}
+          repo: ${{ secrets.PW_ECR_DEV_REPOSITORY }}
+          region: ${{ secrets.PW_AWS_REGION }}
+
