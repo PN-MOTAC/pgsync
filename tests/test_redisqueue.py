@@ -4,26 +4,11 @@ import pytest
 from mock import patch
 from redis.exceptions import ConnectionError
 
-from pgsync.redisqueue import RedisQueue, _create_redis_client
+from pgsync.redisqueue import RedisQueue
 
 
 class TestRedisQueue(object):
     """Redis Queue tests."""
-
-    def setup_method(self):
-        """Set up test method."""
-        # Create a unique namespace for each test to avoid conflicts
-        self.test_namespace = f"test_{id(self)}"
-        self.test_queue_name = "test_queue"
-
-    def teardown_method(self):
-        """Clean up after test method."""
-        # Clean up any test data
-        try:
-            queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
-            queue.delete()
-        except:
-            pass  # Ignore cleanup errors
 
     @patch("pgsync.redisqueue.logger")
     def test_redis_conn(self, mock_logger, mocker):
@@ -59,7 +44,7 @@ class TestRedisQueue(object):
 
     def test_qsize(self, mocker):
         """Test the redis qsize."""
-        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+        queue = RedisQueue("something")
         queue.delete()
         assert queue.qsize == 0
         queue.push([1, 2])
@@ -69,59 +54,38 @@ class TestRedisQueue(object):
 
     def test_push(self):
         """Test the redis push."""
-        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+        queue = RedisQueue("something")
         queue.delete()
         queue.push([1, 2])
         assert queue.qsize == 2
+        queue.push([3, 4, 5])
+        assert queue.qsize == 5
+        queue.delete()
 
-    def test_pop(self):
+    @patch("pgsync.redisqueue.logger")
+    def test_pop(self, mock_logger):
         """Test the redis pop."""
-        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+        queue = RedisQueue("something")
         queue.delete()
         queue.push([1, 2])
         items = queue.pop()
+        mock_logger.debug.assert_called_once_with("pop size: 2")
         assert items == [1, 2]
-        assert queue.qsize == 0
-
-    def test_delete(self):
-        """Test the redis delete."""
-        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+        queue.push([3, 4, 5])
+        items = queue.pop()
+        mock_logger.debug.assert_any_call("pop size: 3")
+        assert items == [3, 4, 5]
         queue.delete()
-        assert queue.qsize == 0
 
-    def test_meta(self):
-        """Test the redis meta."""
-        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
-        queue.delete()  # Clean up any existing data
-        queue.set_meta({"foo": "bar"})
-        assert queue.get_meta() == {"foo": "bar"}
-
-    def test_meta_default(self):
-        """Test the redis meta default."""
-        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
-        queue.delete()  # Clean up any existing data
-        assert queue.get_meta("default") == "default"
-
-
-class TestRedisClusterSupport(object):
-    """Redis Cluster support tests."""
-
-    @patch("pgsync.redisqueue.REDIS_CLUSTER", False)
     @patch("pgsync.redisqueue.logger")
-    def test_create_single_redis_client(self, mock_logger, mocker):
-        """Test single Redis client creation."""
-        # Mock Redis at the module level where it's imported
-        mock_redis = mocker.patch("pgsync.redisqueue.Redis")
-        mock_redis.from_url.return_value = "single_client"
-        
-        client = _create_redis_client("redis://localhost:6379")
-        
-        assert client == "single_client"
-        mock_redis.from_url.assert_called_once()
-        mock_logger.info.assert_called_with("Creating single Redis instance client")
-
-    def test_redis_cluster_configuration(self):
-        """Test that Redis cluster configuration is properly imported."""
-        from pgsync.redisqueue import REDIS_CLUSTER
-        # This should not raise an ImportError
-        assert isinstance(REDIS_CLUSTER, bool)
+    def test_delete(self, mock_logger):
+        queue = RedisQueue("something")
+        queue.push([1])
+        queue.push([2, 3])
+        queue.push([4, 5, 6])
+        assert queue.qsize == 6
+        queue.delete()
+        mock_logger.info.assert_called_once_with(
+            "Deleting redis key: queue:something"
+        )
+        assert queue.qsize == 0

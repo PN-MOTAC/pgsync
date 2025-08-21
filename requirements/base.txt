@@ -64,7 +64,7 @@ python-dotenv==1.1.0
     # via
     #   -r requirements/base.in
     #   environs
-redis>=4.0.0
+redis==6.2.0
     # via -r requirements/base.in
 requests==2.32.4
     # via
