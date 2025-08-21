@@ -10,6 +10,21 @@ from pgsync.redisqueue import RedisQueue, _create_redis_client
 class TestRedisQueue(object):
     """Redis Queue tests."""
 
+    def setup_method(self):
+        """Set up test method."""
+        # Create a unique namespace for each test to avoid conflicts
+        self.test_namespace = f"test_{id(self)}"
+        self.test_queue_name = "test_queue"
+
+    def teardown_method(self):
+        """Clean up after test method."""
+        # Clean up any test data
+        try:
+            queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+            queue.delete()
+        except:
+            pass  # Ignore cleanup errors
+
     @patch("pgsync.redisqueue.logger")
     def test_redis_conn(self, mock_logger, mocker):
         """Test the redis constructor."""
@@ -44,7 +59,7 @@ class TestRedisQueue(object):
 
     def test_qsize(self, mocker):
         """Test the redis qsize."""
-        queue = RedisQueue("something")
+        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
         queue.delete()
         assert queue.qsize == 0
         queue.push([1, 2])
@@ -54,14 +69,14 @@ class TestRedisQueue(object):
 
     def test_push(self):
         """Test the redis push."""
-        queue = RedisQueue("something")
+        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
         queue.delete()
         queue.push([1, 2])
         assert queue.qsize == 2
 
     def test_pop(self):
         """Test the redis pop."""
-        queue = RedisQueue("something")
+        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
         queue.delete()
         queue.push([1, 2])
         items = queue.pop()
@@ -70,19 +85,21 @@ class TestRedisQueue(object):
 
     def test_delete(self):
         """Test the redis delete."""
-        queue = RedisQueue("something")
+        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
         queue.delete()
         assert queue.qsize == 0
 
     def test_meta(self):
         """Test the redis meta."""
-        queue = RedisQueue("something")
+        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+        queue.delete()  # Clean up any existing data
         queue.set_meta({"foo": "bar"})
         assert queue.get_meta() == {"foo": "bar"}
 
     def test_meta_default(self):
         """Test the redis meta default."""
-        queue = RedisQueue("something")
+        queue = RedisQueue(self.test_queue_name, namespace=self.test_namespace)
+        queue.delete()  # Clean up any existing data
         assert queue.get_meta("default") == "default"
 
 
