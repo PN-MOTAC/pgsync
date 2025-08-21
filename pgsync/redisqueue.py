@@ -5,53 +5,16 @@ import logging
 import typing as t
 
 from redis import Redis
-from redis.exceptions import ConnectionError, RedisClusterException
+from redis.exceptions import ConnectionError
 
 from .settings import (
     REDIS_READ_CHUNK_SIZE,
     REDIS_RETRY_ON_TIMEOUT,
     REDIS_SOCKET_TIMEOUT,
-    REDIS_CLUSTER,
 )
 from .urls import get_redis_url
 
 logger = logging.getLogger(__name__)
-
-
-def _create_redis_client(url: str, **kwargs) -> Redis:
-    """
-    Create Redis client based on configuration.
-    Supports both cluster and non-cluster deployments.
-    """
-    if REDIS_CLUSTER:
-        # Try to create RedisCluster client
-        try:
-            from redis import RedisCluster
-            logger.info("Creating Redis cluster client")
-            return RedisCluster.from_url(
-                url,
-                socket_timeout=REDIS_SOCKET_TIMEOUT,
-                retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
-                **kwargs
-            )
-        except (ImportError, AttributeError):
-            # Fall back to single Redis if RedisCluster is not available
-            logger.warning("Redis cluster support not available, falling back to single Redis")
-            return Redis.from_url(
-                url,
-                socket_timeout=REDIS_SOCKET_TIMEOUT,
-                retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
-                **kwargs
-            )
-    else:
-        # Use regular Redis client for non-cluster deployments
-        logger.info("Creating single Redis instance client")
-        return Redis.from_url(
-            url,
-            socket_timeout=REDIS_SOCKET_TIMEOUT,
-            retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
-            **kwargs
-        )
 
 
 class RedisQueue(object):
@@ -62,13 +25,14 @@ class RedisQueue(object):
         url: str = get_redis_url(**kwargs)
         self.key: str = f"{namespace}:{name}"
         self._meta_key: str = f"{self.key}:meta"
-        
         try:
-            self.__db: Redis = _create_redis_client(url, **kwargs)
+            self.__db: Redis = Redis.from_url(
+                url,
+                socket_timeout=REDIS_SOCKET_TIMEOUT,
+                retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
+            )
             self.__db.ping()
-            logger.info(f"Successfully connected to Redis ({'cluster' if REDIS_CLUSTER else 'single instance'})")
-            
-        except (ConnectionError, RedisClusterException) as e:
+        except ConnectionError as e:
             logger.exception(f"Redis server is not running: {e}")
             raise
 

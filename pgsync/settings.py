@@ -195,8 +195,6 @@ REDIS_RETRY_ON_TIMEOUT = env.bool(
     "REDIS_RETRY_ON_TIMEOUT",
     default=False,
 )
-# Redis cluster configuration - just enable/disable cluster mode
-REDIS_CLUSTER = env.bool("REDIS_CLUSTER", default=False)
 
 
 # Logging:
