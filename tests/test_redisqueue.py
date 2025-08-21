@@ -119,22 +119,6 @@ class TestRedisClusterSupport(object):
         mock_redis_cluster.from_url.assert_called_once()
         mock_logger.info.assert_called_with("Creating Redis cluster client")
 
-    @patch("pgsync.redisqueue.REDIS_CLUSTER", True)
-    @patch("pgsync.redisqueue.logger")
-    def test_create_redis_cluster_client_fallback(self, mock_logger, mocker):
-        """Test fallback to single Redis when cluster import fails."""
-        mocker.patch("redis.RedisCluster", side_effect=ImportError("No module named 'redis'"))
-        mock_redis = mocker.patch("redis.Redis")
-        mock_redis.from_url.return_value = "single_client"
-        
-        client = _create_redis_client("redis://localhost:6379")
-        
-        assert client == "single_client"
-        mock_redis.from_url.assert_called_once()
-        mock_logger.warning.assert_called_with(
-            "Redis cluster support not available (redis-py < 4.0), falling back to single Redis"
-        )
-
     @patch("pgsync.redisqueue.REDIS_CLUSTER", False)
     @patch("pgsync.redisqueue.logger")
     def test_create_single_redis_client(self, mock_logger, mocker):

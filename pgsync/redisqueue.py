@@ -24,7 +24,7 @@ def _create_redis_client(url: str, **kwargs) -> Redis:
     Supports both cluster and non-cluster deployments.
     """
     if REDIS_CLUSTER:
-        # Try to import RedisCluster for cluster support
+        # Try to create RedisCluster client
         try:
             from redis import RedisCluster
             logger.info("Creating Redis cluster client")
@@ -34,8 +34,9 @@ def _create_redis_client(url: str, **kwargs) -> Redis:
                 retry_on_timeout=REDIS_RETRY_ON_TIMEOUT,
                 **kwargs
             )
-        except ImportError:
-            logger.warning("Redis cluster support not available (redis-py < 4.0), falling back to single Redis")
+        except (ImportError, AttributeError):
+            # Fall back to single Redis if RedisCluster is not available
+            logger.warning("Redis cluster support not available, falling back to single Redis")
             return Redis.from_url(
                 url,
                 socket_timeout=REDIS_SOCKET_TIMEOUT,
