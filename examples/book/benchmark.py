@@ -8,8 +8,8 @@ from schema import Book
 from sqlalchemy.orm import sessionmaker
 
 from pgsync.base import pg_engine
-from pgsync.constants import DELETE, INSERT, TG_OP, TRUNCATE, UPDATE
-from pgsync.utils import config_loader, get_config, show_settings, Timer
+from pgsync.constants import DELETE, INSERT, TG_OPS, TRUNCATE, UPDATE
+from pgsync.utils import config_loader, show_settings, Timer, validate_config
 
 FIELDS = {
     "isbn": "isbn13",
@@ -128,16 +128,16 @@ def truncate_op(session: sessionmaker, model, nsize: int) -> None:
 @click.option(
     "--tg_op",
     "-t",
-    help="TG_OP",
+    help="TG_OPS to run",
     type=click.Choice(
-        TG_OP,
+        TG_OPS,
         case_sensitive=False,
     ),
 )
 def main(config: str, nsize: int, daemon: bool, tg_op: str):
     show_settings(config)
 
-    config: str = get_config(config)
+    validate_config(config)
     doc: dict = next(config_loader(config))
     database: str = doc.get("database", doc["index"])
     with pg_engine(database) as engine:
@@ -156,7 +156,7 @@ def main(config: str, nsize: int, daemon: bool, tg_op: str):
             if tg_op:
                 func[tg_op](session, model, nsize)
             else:
-                func[choice(TG_OP)](session, model, nsize)
+                func[choice(TG_OPS)](session, model, nsize)
             if not daemon:
                 break
 

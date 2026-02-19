@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """The setup script."""
+
 import os
 import re
 
@@ -20,11 +21,11 @@ def get_version() -> str:
 
 # Package meta-data.
 NAME = "pgsync"
-DESCRIPTION = "Postgres to Elasticsearch/OpenSearch sync"
+DESCRIPTION = "Postgres/MySQL/MariaDB to Elasticsearch/OpenSearch sync"
 URL = "https://github.com/toluaina/pgsync"
 AUTHOR = MAINTAINER = "Tolu Aina"
 AUTHOR_EMAIL = MAINTAINER_EMAIL = "tolu@pgsync.com"
-PYTHON_REQUIRES = ">=3.9.0"
+PYTHON_REQUIRES = ">=3.10.0"
 VERSION = get_version()
 INSTALL_REQUIRES = []
 KEYWORDS = [
@@ -33,17 +34,19 @@ KEYWORDS = [
     "opensearch",
     "pgsync",
     "postgres",
+    "mysql",
+    "mariadb",
 ]
 LICENSE = "MIT"
 CLASSIFIERS = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Natural Language :: English",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "License :: OSI Approved :: MIT License",
@@ -73,7 +76,7 @@ setup(
     python_requires=PYTHON_REQUIRES,
     description=DESCRIPTION,
     long_description=README,
-    long_description_content_type="text/markdown",
+    long_description_content_type="text/x-rst",
     install_requires=INSTALL_REQUIRES,
     include_package_data=True,
     keywords=KEYWORDS,

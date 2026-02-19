@@ -1,105 +1,179 @@
-# PostgreSQL to Elasticsearch/OpenSearch sync
+======
+PGSync
+======
 
+.. image:: https://img.shields.io/pypi/v/pgsync.svg
+   :target: https://pypi.org/project/pgsync/
+   :alt: PyPI Version
 
-- [PGSync](https://pgsync.com) is a middleware for syncing data from [Postgres](https://www.postgresql.org) to [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/) or [OpenSearch](https://opensearch.org/).
-- It allows you to keep [Postgres](https://www.postgresql.org) as your source of truth data source and
-expose structured denormalized documents in [Elasticsearch](https://www.elastic.co/products/elastic-stack)/[OpenSearch](https://opensearch.org/).
+.. image:: https://img.shields.io/pypi/pyversions/pgsync.svg
+   :target: https://pypi.org/project/pgsync/
+   :alt: Python Versions
 
+.. image:: https://img.shields.io/pypi/l/pgsync.svg
+   :target: https://opensource.org/licenses/MIT
+   :alt: License
 
-### Requirements
+.. image:: https://img.shields.io/pypi/dm/pgsync.svg
+   :target: https://pypi.org/project/pgsync/
+   :alt: Downloads
 
-- [Python](https://www.python.org) 3.9+
-- [Postgres](https://www.postgresql.org) 9.6+
-- [Redis](https://redis.io) 3.1.0+
-- [Elasticsearch](https://www.elastic.co/products/elastic-stack) 6.3.1+ or [OpenSearch](https://opensearch.org/) 1.3.7+
-- [SQlAlchemy](https://www.sqlalchemy.org) 1.3.4+
+|
 
-### Postgres setup
-  
-  Enable [logical decoding](https://www.postgresql.org/docs/current/logicaldecoding.html) in your 
-  Postgres setting.
+**PostgreSQL/MySQL/MariaDB to Elasticsearch/OpenSearch sync**
 
-  - You also need to set up two parameters in your Postgres config postgresql.conf
+`PGSync <https://pgsync.com>`_ is a middleware for syncing data from `PostgreSQL <https://www.postgresql.org>`_, `MySQL <https://www.mysql.com>`_, or `MariaDB <https://mariadb.org>`_ to `Elasticsearch <https://www.elastic.co/products/elastic-stack>`_ or `OpenSearch <https://opensearch.org>`_.
 
-    ```wal_level = logical```
+Keep your relational database as the source of truth and expose structured denormalized documents in your search engine.
 
-    ```max_replication_slots = 1```
+Key Features
+------------
 
-### Installation
+- Real-time sync via logical decoding (PostgreSQL) or binary log (MySQL/MariaDB)
+- Denormalize complex relational data into nested search documents
+- JSON schema-based configuration
+- Support for one-to-one, one-to-many relationships
+- Plugin system for document transformation
+- Multiple operation modes: daemon, polling, or direct WAL streaming
 
-You can install PGSync from [PyPI](https://pypi.org):
+Requirements
+------------
 
-    $ pip install pgsync
+- `Python <https://www.python.org>`_ 3.10+
+- `PostgreSQL <https://www.postgresql.org>`_ 9.6+ or `MySQL <https://www.mysql.com>`_ 8.0.0+ or `MariaDB <https://mariadb.org>`_ 12.0.0+
+- `Redis <https://redis.io>`_ 3.1.0+ or `Valkey <https://valkey.io>`_ 7.2.0+ (optional in WAL mode)
+- `Elasticsearch <https://www.elastic.co/products/elastic-stack>`_ 6.3.1+ or `OpenSearch <https://opensearch.org>`_ 1.3.7+
 
-### Config
+Installation
+------------
 
-Create a schema for the application named e.g **schema.json**
+Install from `PyPI <https://pypi.org/project/pgsync/>`_:
 
-[Example schema](https://github.com/toluaina/pgsync/blob/main/examples/airbnb/schema.json)
+.. code-block:: bash
 
-Example spec
+   pip install pgsync
 
-.. code-block::
+Database Setup
+--------------
 
-    [
-        {
-            "database": "[database name]",
-            "index": "[Elasticsearch or OpenSearch index]",
-            "nodes": {
-                "table": "[table A]",
-                "schema": "[table A schema]",
-                "columns": [
-                    "column 1 from table A",
-                    "column 2 from table A",
-                    ... additional columns
-                ],
-                "children": [
-                    {
-                        "table": "[table B with relationship to table A]",
-                        "schema": "[table B schema]",
-                        "columns": [
-                          "column 1 from table B",
-                          "column 2 from table B",
-                          ... additional columns
-                        ],
-                        "relationship": {
-                            "variant": "object",
-                            "type": "one_to_many"
-                        },
-                        ...
-                    },
-                    {
-                        ... additional children
-                    }
-                ]
-            }
-        }
-    ]
+PostgreSQL
+~~~~~~~~~~
 
-### Environment variables 
+Enable `logical decoding <https://www.postgresql.org/docs/current/logicaldecoding.html>`_ in your PostgreSQL configuration (``postgresql.conf``):
 
-Setup environment variables required for the application
+.. code-block:: ini
 
-    SCHEMA='/path/to/schema.json'
+   wal_level = logical
+   max_replication_slots = 1
 
-    ELASTICSEARCH_HOST=localhost
-    ELASTICSEARCH_PORT=9200
+MySQL / MariaDB
+~~~~~~~~~~~~~~~
 
-    PG_HOST=localhost
-    PG_USER=i-am-root # this must be a postgres superuser or replication user
-    PG_PORT=5432
-    PG_PASSWORD=*****
+Enable binary logging in your MySQL/MariaDB configuration (``my.cnf``):
 
-    REDIS_HOST=redis
-    REDIS_PORT=6379
-    REDIS_DB=0
-    REDIS_AUTH=*****
+.. code-block:: ini
 
+   server-id = 1
+   log_bin = mysql-bin
+   binlog_row_image = FULL
+   binlog_expire_logs_seconds = 604800
 
-### Running
+Create a replication user:
 
-Bootstrap the database (one time only)
-  - $ bootstrap --config schema.json
+.. code-block:: sql
 
-Run pgsync as a daemon
-  - $ pgsync --config schema.json --daemon
+   CREATE USER 'replicator'@'%' IDENTIFIED WITH mysql_native_password BY 'password';
+   GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replicator'@'%';
+   FLUSH PRIVILEGES;
+
+Configuration
+-------------
+
+Create a JSON schema file (e.g., ``schema.json``) defining your sync mapping:
+
+.. code-block:: json
+
+   [
+       {
+           "database": "book",
+           "index": "book",
+           "nodes": {
+               "table": "book",
+               "columns": ["isbn", "title", "description"],
+               "children": [
+                   {
+                       "table": "publisher",
+                       "columns": ["name"],
+                       "relationship": {
+                           "variant": "object",
+                           "type": "one_to_one"
+                       }
+                   },
+                   {
+                       "table": "author",
+                       "label": "authors",
+                       "columns": ["name", "date_of_birth"],
+                       "relationship": {
+                           "variant": "object",
+                           "type": "one_to_many",
+                           "through_tables": ["book_author"]
+                       }
+                   }
+               ]
+           }
+       }
+   ]
+
+See the `examples directory <https://github.com/toluaina/pgsync/tree/main/examples>`_ for more schema examples (airbnb, social, rental, etc.).
+
+Environment Variables
+---------------------
+
+Configure PGSync via environment variables:
+
+.. code-block:: bash
+
+   # Schema
+   SCHEMA='/path/to/schema.json'
+
+   # PostgreSQL
+   PG_HOST=localhost
+   PG_PORT=5432
+   PG_USER=postgres
+   PG_PASSWORD=*****
+
+   # Elasticsearch / OpenSearch
+   ELASTICSEARCH_HOST=localhost
+   ELASTICSEARCH_PORT=9200
+
+   # Redis (optional in WAL mode)
+   REDIS_HOST=localhost
+   REDIS_PORT=6379
+
+Running
+-------
+
+**Bootstrap** (run once to set up triggers and replication slots):
+
+.. code-block:: bash
+
+   bootstrap --config schema.json
+
+**Run as daemon**:
+
+.. code-block:: bash
+
+   pgsync --config schema.json --daemon
+
+Links
+-----
+
+- **Documentation**: https://pgsync.com
+- **Source Code**: https://github.com/toluaina/pgsync
+- **Bug Reports**: https://github.com/toluaina/pgsync/issues
+- **Sponsor**: https://github.com/sponsors/toluaina
+
+License
+-------
+
+MIT License - see `LICENSE <https://github.com/toluaina/pgsync/blob/main/LICENSE>`_ for details.
