@@ -1,23 +1,31 @@
-FROM python:3.9
+FROM python:3.12-slim AS build
 
-# Set a working directory
 ARG WORKDIR=/code
-RUN mkdir $WORKDIR
-WORKDIR $WORKDIR
+ARG EXAMPLE_NAME=airbnb
+ENV EXAMPLE_NAME=$EXAMPLE_NAME
 
-# Install pgsync
-RUN pip install git+https://github.com/toluaina/pgsync.git
+# Create and switch to workdir
+RUN mkdir -p "$WORKDIR"
+WORKDIR "$WORKDIR"
 
-# Copy necessary scripts
-COPY ./docker/wait-for-it.sh wait-for-it.sh
-COPY ./docker/runserver.sh runserver.sh
+# Install git and curl (required for pip install from git+ URL and schema download)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project files
+COPY ./examples/ ./examples
+COPY ./docker/wait-for-it.sh ./wait-for-it.sh
+COPY ./docker/runserver.sh ./runserver.sh
 
 # Copy plugins directory into the container
 COPY ./plugins $WORKDIR/plugins
 
-# Set permissions for scripts
-RUN chmod +x wait-for-it.sh
-RUN chmod +x runserver.sh
+# Install pgsync from GitHub
+RUN pip install --no-cache-dir git+https://github.com/toluaina/pgsync.git
+
+# Make scripts executable
+RUN chmod +x wait-for-it.sh runserver.sh
 
 # Set PYTHONPATH to point to the parent directory of the plugins folder
 ENV PYTHONPATH="$WORKDIR"

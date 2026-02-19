@@ -1,8 +1,13 @@
-"""PGSync Trigger template.
+"""PGSync trigger template.
 
-This module contains a template for creating a PostgreSQL trigger function that notifies updates asynchronously.
-The trigger function constructs a notification as a JSON object and sends it to a channel using PG_NOTIFY.
-The notification contains information about the updated table, the operation performed, the old and new rows, and the indices.
+This module contains the template for a PostgreSQL trigger function that sends
+change notifications asynchronously via PG_NOTIFY.
+
+The trigger constructs a JSON notification containing:
+- The table name and schema
+- The operation type (INSERT, UPDATE, DELETE, TRUNCATE)
+- The old and new row data (primary and foreign keys only)
+- The associated Elasticsearch/OpenSearch indices
 """
 
 from .constants import MATERIALIZED_VIEW, TRIGGER_FUNC
@@ -18,6 +23,8 @@ DECLARE
   _indices TEXT [];
   _primary_keys TEXT [];
   _foreign_keys TEXT [];
+  _columns TEXT [];
+  _changed BOOLEAN;
 
 BEGIN
     -- database is also the channel name.
@@ -25,8 +32,7 @@ BEGIN
 
     IF TG_OP = 'DELETE' THEN
 
-        SELECT primary_keys, indices
-        INTO _primary_keys, _indices
+        SELECT primary_keys, indices INTO _primary_keys, _indices
         FROM {MATERIALIZED_VIEW}
         WHERE table_name = TG_TABLE_NAME;
 
@@ -40,10 +46,29 @@ BEGIN
     ELSE
         IF TG_OP <> 'TRUNCATE' THEN
 
-            SELECT primary_keys, foreign_keys, indices
-            INTO _primary_keys, _foreign_keys, _indices
+            SELECT primary_keys, foreign_keys, indices, columns
+            INTO _primary_keys, _foreign_keys, _indices, _columns
             FROM {MATERIALIZED_VIEW}
             WHERE table_name = TG_TABLE_NAME;
+
+            -- normalize null to empty array
+            _columns := COALESCE(_columns, ARRAY[]::TEXT[]);
+
+            -- Only react if any _columns actually changed
+            IF TG_OP = 'UPDATE' THEN
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM JSONB_EACH(TO_JSONB(NEW.*)) n
+                    JOIN JSONB_EACH(TO_JSONB(OLD.*)) o USING (key)
+                    WHERE n.key = ANY(_columns)
+                    AND n.value IS DISTINCT FROM o.value
+                )
+                INTO _changed;
+
+                IF NOT _changed THEN
+                    RETURN NEW;  -- skip notification; nothing relevant changed
+                END IF;
+            END IF;
 
             new_row = ROW_TO_JSON(NEW);
             new_row := (

@@ -2,12 +2,17 @@
 
 import logging
 import os
+import random
+import threading
 import time
 import typing as t
 from contextlib import contextmanager
 
+import psycopg2
 import sqlalchemy as sa
+from psycopg2.extras import LogicalReplicationConnection
 from sqlalchemy.dialects import postgresql  # noqa
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import sessionmaker
 
 from .constants import (
@@ -18,7 +23,7 @@ from .constants import (
     LOGICAL_SLOT_SUFFIX,
     MATERIALIZED_VIEW,
     PLUGIN,
-    TG_OP,
+    TG_OPS,
     TRIGGER_FUNC,
     UPDATE,
 )
@@ -28,14 +33,29 @@ from .exc import (
     TableNotFoundError,
 )
 from .settings import (
+    IS_MYSQL_COMPAT,
+    MYSQL_DATABASE,
+    PG_DATABASE,
+    PG_HOST_RO,
+    PG_PASSWORD_RO,
+    PG_PORT_RO,
     PG_SSLMODE,
     PG_SSLROOTCERT,
+    PG_URL_RO,
+    PG_USER_RO,
+    PG_WORK_MEM,
     QUERY_CHUNK_SIZE,
+    SQLALCHEMY_MAX_OVERFLOW,
+    SQLALCHEMY_POOL_PRE_PING,
+    SQLALCHEMY_POOL_RECYCLE,
+    SQLALCHEMY_POOL_SIZE,
+    SQLALCHEMY_POOL_TIMEOUT,
+    SQLALCHEMY_USE_NULLPOOL,
     STREAM_RESULTS,
 )
 from .trigger import CREATE_TRIGGER_TEMPLATE
-from .urls import get_postgres_url
-from .utils import compiled_query
+from .urls import get_database_url
+from .utils import compiled_query, qname
 from .view import create_view, DropView, is_view, RefreshView
 
 try:
@@ -47,7 +67,6 @@ try:
     import geoalchemy2  # noqa
 except ImportError:
     pass
-
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +172,8 @@ class TupleIdentifierType(sa.types.UserDefinedType):
 
 
 class Base(object):
+    _thread_local = threading.local()
+
     INT_TYPES = (
         "bigint",
         "bigserial",
@@ -190,6 +211,26 @@ class Base(object):
         self.__engine: sa.engine.Engine = _pg_engine(
             database, echo=False, **kwargs
         )
+        self.__engine_ro: t.Optional[sa.engine.Engine] = None
+        if (
+            PG_USER_RO
+            or PG_HOST_RO
+            or PG_PASSWORD_RO
+            or PG_PORT_RO
+            or PG_URL_RO
+        ):
+            kwargs.update(
+                {
+                    "user": PG_USER_RO,
+                    "host": PG_HOST_RO,
+                    "password": PG_PASSWORD_RO,
+                    "port": PG_PORT_RO,
+                    "url": PG_URL_RO,
+                }
+            )
+            self.__engine_ro: sa.engine.Engine = _pg_engine(
+                database, echo=False, **kwargs
+            )
         self.__schemas: t.Optional[dict] = None
         # models is a dict of f'{schema}.{table}'
         self.__models: dict = {}
@@ -201,6 +242,7 @@ class Base(object):
         self.__columns: dict = {}
         self.verbose: bool = verbose
         self._conn = None
+        self._session = None
 
     def connect(self) -> None:
         """Connect to database."""
@@ -223,6 +265,14 @@ class Base(object):
             )[0]
         except (TypeError, IndexError):
             return None
+
+    @property
+    def is_mysql_compat(self) -> bool:
+        """
+        True when running against a MySQL-family backend (MySQL or MariaDB),
+        regardless of the specific driver in use.
+        """
+        return IS_MYSQL_COMPAT
 
     def _can_create_replication_slot(self, slot_name: str) -> None:
         """Check if the given user can create and destroy replication slots."""
@@ -301,12 +351,25 @@ class Base(object):
 
     @property
     def session(self) -> sessionmaker:
-        Session = sessionmaker(bind=self.engine.connect(), autoflush=True)
-        return Session()
+        if self._session is None:
+            Session = sessionmaker(bind=self.engine, autoflush=True)
+            self._session = Session()
+        return self._session
+
+    def close_session(self) -> None:
+        """Close the cached session and reset it."""
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
 
     @property
     def engine(self) -> sa.engine.Engine:
         """Get the database engine."""
+        if getattr(self._thread_local, "read_only", False):
+            return self.__engine_ro
         return self.__engine
 
     @property
@@ -336,6 +399,9 @@ class Base(object):
 
     def _materialized_views(self, schema: str) -> list:
         """Get all materialized views."""
+        if self.is_mysql_compat:
+            return []
+
         if schema not in self.__materialized_views:
             self.__materialized_views[schema] = []
             for table in sa.inspect(self.engine).get_materialized_view_names(
@@ -385,9 +451,13 @@ class Base(object):
             schema (str): The database schema
 
         """
-        logger.debug(f"Truncating table: {schema}.{table}")
-        self.execute(sa.text(f'TRUNCATE TABLE "{schema}"."{table}" CASCADE'))
-        logger.debug(f"Truncated table: {schema}.{table}")
+        table_name: str = qname(self.engine, schema, table)
+        logger.debug(f"Truncating table: {table_name}")
+        if self.is_mysql_compat:
+            self.execute(sa.text(f"TRUNCATE TABLE {table_name}"))
+        else:
+            self.execute(sa.text(f"TRUNCATE TABLE {table_name} CASCADE"))
+        logger.debug(f"Truncated table: {table_name}")
 
     def truncate_tables(
         self, tables: t.List[str], schema: str = DEFAULT_SCHEMA
@@ -420,23 +490,20 @@ class Base(object):
 
         SELECT * FROM PG_REPLICATION_SLOTS
         """
-        with self.advisory_lock(
-            slot_name, max_retries=None, retry_interval=0.1
-        ):
-            return self.fetchall(
-                sa.select("*")
-                .select_from(sa.text("PG_REPLICATION_SLOTS"))
-                .where(
-                    sa.and_(
-                        *[
-                            sa.column("slot_name") == slot_name,
-                            sa.column("slot_type") == slot_type,
-                            sa.column("plugin") == plugin,
-                        ]
-                    )
-                ),
-                label="replication_slots",
-            )
+        return self.fetchall(
+            sa.select("*")
+            .select_from(sa.text("PG_REPLICATION_SLOTS"))
+            .where(
+                sa.and_(
+                    *[
+                        sa.column("slot_name") == slot_name,
+                        sa.column("slot_type") == slot_type,
+                        sa.column("plugin") == plugin,
+                    ]
+                )
+            ),
+            label="replication_slots",
+        )
 
     def create_replication_slot(self, slot_name: str) -> None:
         """Create a replication slot.
@@ -485,35 +552,65 @@ class Base(object):
 
     def advisory_key(self, slot_name: str) -> int:
         """Compute a stable bigint advisory key from slot name."""
-        return self.fetchone(
-            sa.text("SELECT HASHTEXT(:slot)::BIGINT").bindparams(
+        if self.is_mysql_compat:
+            # 'adv:' + 60 hex chars = 64 total; deterministic and safe for GET_LOCK
+            row = self.fetchone(
+                sa.text(
+                    "SELECT CONCAT('adv:', LEFT(SHA2(:slot, 256), 60))"
+                ).bindparams(slot=slot_name)
+            )
+            return row[0]
+        # PostgreSQL: stable bigint via hashtext
+        row = self.fetchone(
+            sa.text("SELECT hashtext(:slot)::bigint").bindparams(
                 slot=slot_name
             )
-        )[0]
+        )
+        return row[0]
 
-    def pg_try_advisory_lock(self, key: int) -> bool:
+    def pg_try_advisory_lock(
+        self, key: t.Union[int, str], timeout: int = 0
+    ) -> bool:
         """
-        Attempts to acquire an advisory lock based on a hashed slot name.
+        Attempts to acquire an dvisory/named lock based on a hashed slot name without blocking.
+
+        PostgreSQL: integer key -> PG_TRY_ADVISORY_LOCK(key) -> bool
+        MySQL/MariaDB: string name -> GET_LOCK(name, timeout) -> 1 on success
+                    (timeout defaults to 0 = non-blocking)
 
         Returns:
             bool: True if the lock was acquired, False otherwise.
         """
-        result = self.fetchone(
+        if self.is_mysql_compat:
+            row = self.fetchone(
+                sa.text("SELECT GET_LOCK(:name, :timeout)").bindparams(
+                    name=str(key), timeout=int(timeout)
+                )
+            )
+            return bool(row and row[0] == 1)
+
+        row = self.fetchone(
             sa.text("SELECT PG_TRY_ADVISORY_LOCK(:key)").bindparams(key=key)
         )
-        return result[0] if result else False
+        return bool(row and row[0])
 
-    def pg_advisory_unlock(self, key: int) -> bool:
+    def pg_advisory_unlock(self, key: t.Union[int, str]) -> bool:
         """
         Releases an advisory lock associated with the hashed slot name.
 
         Returns:
             bool: True if the lock was released, False if it was not held.
         """
-        result = self.fetchone(
+        if self.is_mysql_compat:
+            row = self.fetchone(
+                sa.text("SELECT RELEASE_LOCK(:name)").bindparams(name=str(key))
+            )
+            return bool(row and row[0] == 1)
+
+        row = self.fetchone(
             sa.text("SELECT PG_ADVISORY_UNLOCK(:key)").bindparams(key=key)
         )
-        return result[0] if result else False
+        return bool(row and row[0])
 
     @contextmanager
     def advisory_lock(
@@ -523,30 +620,65 @@ class Base(object):
         retry_interval: float = 1.0,
         backoff_type: str = "fixed",  # or "exponential"
         backoff_factor: float = 2.0,
+        jitter: str = "full",  # "none" | "full" | "equal" | "decorrelated"
+        max_delay: float = 30.0,  # cap for delay growth
     ):
-        """Context manager to acquire a PostgreSQL advisory lock with optional retries."""
+        """
+        Context manager to acquire a PostgreSQL advisory lock with optional retries.
+        Acquire a PostgreSQL advisory lock with retries, backoff, and jitter.
+        Jitter reduces lock-step contention so callers don't starve.
+        """
         key: int = self.advisory_key(slot_name)
         attempt: int = 0
-        delay: int = retry_interval
+
+        base_delay: float = float(retry_interval)
+        # current backoff window (seconds)
+        delay: float = base_delay
+
         while True:
             if self.pg_try_advisory_lock(key):
                 break
 
-            if max_retries is not None and attempt >= max_retries:
+            if (max_retries is not None) and (attempt >= max_retries):
                 raise RuntimeError(
                     f"Failed to acquire advisory lock for '{slot_name}' after {max_retries} retries."
                 )
 
-            time.sleep(delay)
-            if backoff_type == "exponential":
-                delay *= backoff_factor
+            # Compute sleep using jitter strategy
+            if jitter == "decorrelated":
+                # Decorrelated jitter chooses the *next* delay first.
+                delay = min(max_delay, random.uniform(base_delay, delay * 3))
+                sleep_for = delay
+            else:
+                # For other modes, sleep is derived from current delay.
+                if jitter == "full":
+                    sleep_for = random.uniform(0.0, delay)
+                elif jitter == "equal":
+                    sleep_for = (delay / 2.0) + random.uniform(
+                        0.0, delay / 2.0
+                    )
+                elif jitter == "none":
+                    sleep_for = delay
+                else:
+                    # Fallback to full jitter if an unknown option is passed
+                    sleep_for = random.uniform(0.0, delay)
+
+            time.sleep(max(0.0, sleep_for))
+
+            # Increase delay for next attempt (except decorrelated which already advanced)
+            if backoff_type == "exponential" and jitter != "decorrelated":
+                delay = min(max_delay, delay * backoff_factor)
+            # For fixed backoff, 'delay' stays at base_delay unless decorrelated changed it.
 
             attempt += 1
 
         try:
             yield
         finally:
-            self.pg_advisory_unlock(key)
+            try:
+                self.pg_advisory_unlock(key)
+            except Exception:
+                pass
 
     def _logical_slot_changes(
         self,
@@ -714,6 +846,7 @@ class Base(object):
         schema: str,
         tables: t.Set,
         user_defined_fkey_tables: dict,
+        node_columns: dict,
     ) -> None:
         create_view(
             self.engine,
@@ -724,6 +857,7 @@ class Base(object):
             tables,
             user_defined_fkey_tables,
             self._materialized_views(schema),
+            node_columns,
         )
 
     def drop_view(self, schema: str) -> None:
@@ -838,9 +972,9 @@ class Base(object):
         """Check if the trigger function exists."""
         return self.exists(
             sa.text(
-                f"SELECT 1 FROM pg_proc WHERE proname = :name "
-                f"AND pronamespace = (SELECT oid FROM pg_namespace "
-                f"WHERE nspname = :schema)"
+                "SELECT 1 FROM pg_proc WHERE proname = :name "
+                "AND pronamespace = (SELECT oid FROM pg_namespace "
+                "WHERE nspname = :schema)"
             ).bindparams(name=TRIGGER_FUNC, schema=schema),
         )
 
@@ -881,7 +1015,7 @@ class Base(object):
             self.disable_trigger(schema, table)
             logger.debug(f"Disabled trigger on table: {schema}.{table}")
 
-    def enable_trigger(self, schema: str, table, str) -> None:
+    def enable_trigger(self, schema: str, table: str) -> None:
         """Enable a pgsync defined trigger."""
         for name in ("notify", "truncate"):
             self.execute(
@@ -910,6 +1044,35 @@ class Base(object):
             label="txid_current",
         )[0]
 
+    def pg_visible_in_snapshot(
+        self, literal_binds: bool = False
+    ) -> t.Callable[[t.List[int]], dict]:
+        def _pg_visible_in_snapshot(xid8s: t.List[int]) -> dict:
+            if not xid8s:
+                return {}
+            # TODO: use the SQLAlchemy ORM to handle this query
+            statement = sa.text("""
+                SELECT xid AS xid8,
+                PG_VISIBLE_IN_SNAPSHOT(xid::xid8, PG_CURRENT_SNAPSHOT()) AS visible
+                FROM UNNEST(CAST(:xid8s AS text[]))
+                WITH ORDINALITY AS t(xid, ord)
+                ORDER BY t.ord
+            """)
+            if self.verbose:
+                compiled_query(
+                    statement,
+                    label="xmin_visibility",
+                    literal_binds=literal_binds,
+                )
+
+            # xid8s = list of xid8 strings
+            params: dict = {"xid8s": list(map(str, xid8s))}
+            with self.__engine_ro.connect() as conn:
+                result = conn.execute(statement, params)
+                return {int(row.xid8): row.visible for row in result}
+
+        return _pg_visible_in_snapshot
+
     def parse_value(self, type_: str, value: str) -> t.Optional[str]:
         """
         Parse datatypes from db.
@@ -937,29 +1100,30 @@ class Base(object):
         return value
 
     def parse_logical_slot(self, row: str) -> Payload:
-        def _parse_logical_slot(data: str) -> t.Tuple[str, str]:
+
+        def _parse_logical_slot(data: str) -> t.Iterator[t.Tuple[str, t.Any]]:
+            pos: int = 0
             while True:
-                match = LOGICAL_SLOT_SUFFIX.search(data)
+                match = LOGICAL_SLOT_SUFFIX.search(data, pos)
                 if not match:
                     break
 
-                key: str = match.groupdict().get("key")
-                if key:
-                    key = key.replace('"', "")
-                value: str = match.groupdict().get("value")
-                type_: str = match.groupdict().get("type")
+                key = (match.groupdict().get("key") or "").replace('"', "")
+                raw_value = match.groupdict().get("value") or ""
+                type_ = match.groupdict().get("type") or ""
 
-                value = self.parse_value(type_, value)
+                parsed = self.parse_value(type_, raw_value)
+                yield key, parsed
 
-                # set data for next iteration of the loop
-                data = f"{data[match.span()[1]:]} "
-                yield key, value
+                start, end = match.span()
+                # advance safely even if the pattern can match zero-length
+                pos = end if end > start else end + 1
 
         match = LOGICAL_SLOT_PREFIX.search(row)
         if not match:
             raise LogicalSlotParseError(f"No match for row: {row}")
 
-        data = {"old": None, "new": None}
+        data: dict = {"old": None, "new": None}
         data.update(**match.groupdict())
         payload: Payload = Payload(**data)
 
@@ -967,27 +1131,28 @@ class Base(object):
         # including trailing space below is deliberate
         suffix: str = f"{row[span[1]:]} "
 
-        if "old-key" and "new-tuple" in suffix:
+        if "old-key" in suffix and "new-tuple" in suffix:
             # this can only be an UPDATE operation
             if payload.tg_op != UPDATE:
                 msg = f"Unknown {payload.tg_op} operation for row: {row}"
                 raise LogicalSlotParseError(msg)
 
-            i: int = suffix.index("old-key:")
+            i: int = suffix.find("old-key:")
             if i > -1:
-                j: int = suffix.index("new-tuple:")
-                s: str = suffix[i + len("old-key:") : j]
-                for key, value in _parse_logical_slot(s):
-                    payload.old[key] = value
+                j: int = suffix.find("new-tuple:")
+                if j > -1:
+                    s: str = suffix[i + len("old-key:") : j]
+                    for key, value in _parse_logical_slot(s):
+                        payload.old[key] = value
 
-            i = suffix.index("new-tuple:")
+            i = suffix.find("new-tuple:")
             if i > -1:
                 s = suffix[i + len("new-tuple:") :]
                 for key, value in _parse_logical_slot(s):
                     payload.new[key] = value
         else:
             # this can be an INSERT, DELETE, UPDATE or TRUNCATE operation
-            if payload.tg_op not in TG_OP:
+            if payload.tg_op not in TG_OPS:
                 raise LogicalSlotParseError(
                     f"Unknown {payload.tg_op} operation for row: {row}"
                 )
@@ -1159,17 +1324,23 @@ def pg_engine(
     )
 
 
-def _pg_engine(
+def _pg_connect_config(
+    *,
     database: str,
     user: t.Optional[str] = None,
     host: t.Optional[str] = None,
     password: t.Optional[str] = None,
     port: t.Optional[int] = None,
-    echo: bool = False,
     sslmode: t.Optional[str] = None,
     sslrootcert: t.Optional[str] = None,
-) -> sa.engine.Engine:
+    url: t.Optional[str] = None,
+) -> tuple[str, dict]:
+    """
+    Shared config builder for both SQLAlchemy engines and direct psycopg2 connects.
+    Returns (url, connect_args).
+    """
     connect_args: dict = {}
+
     sslmode = sslmode or PG_SSLMODE
     sslrootcert = sslrootcert or PG_SSLROOTCERT
 
@@ -1187,44 +1358,160 @@ def _pg_engine(
             )
         connect_args["sslrootcert"] = sslrootcert
 
-    url: str = get_postgres_url(
-        database,
+    if url is None:
+        url = get_database_url(
+            database,
+            user=user,
+            host=host,
+            password=password,
+            port=port,
+        )
+
+    return url, connect_args
+
+
+def _pg_engine(
+    database: str,
+    user: t.Optional[str] = None,
+    host: t.Optional[str] = None,
+    password: t.Optional[str] = None,
+    port: t.Optional[int] = None,
+    echo: bool = False,
+    sslmode: t.Optional[str] = None,
+    sslrootcert: t.Optional[str] = None,
+    url: t.Optional[str] = None,
+) -> sa.engine.Engine:
+    url, connect_args = _pg_connect_config(
+        database=database,
         user=user,
         host=host,
         password=password,
         port=port,
+        sslmode=sslmode,
+        sslrootcert=sslrootcert,
+        url=url,
     )
-    return sa.create_engine(url, echo=echo, connect_args=connect_args)
+
+    # Use NullPool for testing to avoid connection exhaustion
+    if SQLALCHEMY_USE_NULLPOOL:
+        from sqlalchemy.pool import NullPool
+
+        engine = sa.create_engine(
+            url,
+            echo=echo,
+            connect_args=connect_args,
+            poolclass=NullPool,
+        )
+    else:
+        engine = sa.create_engine(
+            url,
+            echo=echo,
+            connect_args=connect_args,
+            pool_size=SQLALCHEMY_POOL_SIZE,
+            max_overflow=SQLALCHEMY_MAX_OVERFLOW,
+            pool_pre_ping=SQLALCHEMY_POOL_PRE_PING,
+            pool_recycle=SQLALCHEMY_POOL_RECYCLE,
+            pool_timeout=SQLALCHEMY_POOL_TIMEOUT,
+        )
+
+    # Set work_mem on each connection if configured.
+    # This prevents temp file creation during complex queries with
+    # LATERAL JOINs and JSON aggregation (typically needs 12-16MB).
+    if PG_WORK_MEM and not IS_MYSQL_COMPAT:
+        from sqlalchemy import event
+
+        @event.listens_for(engine, "connect")
+        def set_work_mem(dbapi_conn, connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute(f"SET work_mem = '{PG_WORK_MEM}'")
+            cursor.close()
+
+        logger.debug(f"Configured work_mem={PG_WORK_MEM} for new connections")
+
+    return engine
+
+
+def pg_logical_repl_conn(
+    *,
+    database: str,
+    user: t.Optional[str] = None,
+    host: t.Optional[str] = None,
+    password: t.Optional[str] = None,
+    port: t.Optional[int] = None,
+    sslmode: t.Optional[str] = None,
+    sslrootcert: t.Optional[str] = None,
+    url: t.Optional[str] = None,
+) -> psycopg2.extensions.connection:
+    url, connect_args = _pg_connect_config(
+        database=database,
+        user=user,
+        host=host,
+        password=password,
+        port=port,
+        sslmode=sslmode,
+        sslrootcert=sslrootcert,
+        url=url,
+    )
+
+    url_: sa.engine.URL = make_url(url)
+
+    conn: psycopg2.extensions.connection = psycopg2.connect(
+        host=url_.host,
+        port=url_.port or 5432,
+        user=url_.username,
+        password=url_.password,
+        dbname=url_.database,
+        connection_factory=LogicalReplicationConnection,
+        **connect_args,
+    )
+
+    return conn
 
 
 def pg_execute(
     engine: sa.engine.Engine,
     statement: sa.sql.Select,
-    values: t.Optional[list] = None,
+    values: t.Optional[t.Mapping] = None,
     options: t.Optional[dict] = None,
-) -> None:
+) -> sa.engine.Result:
+    """Execute a query statement."""
     with engine.connect() as conn:
         if options:
             conn = conn.execution_options(**options)
-        conn.execute(statement, values)
-        conn.commit()
+
+        # Don't pass `None` as values
+        if values is not None:
+            result = conn.execute(statement, values)
+        else:
+            result = conn.execute(statement)
+
+        # If caller did NOT request AUTOCOMMIT, commit the transaction
+        if not (options and options.get("isolation_level") == "AUTOCOMMIT"):
+            conn.commit()
+        return result
 
 
 def create_schema(database: str, schema: str, echo: bool = False) -> None:
     """Create database schema."""
-    logger.debug(f"Creating schema: {schema}")
-    with pg_engine(database, echo=echo) as engine:
-        pg_execute(engine, sa.text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
-    logger.debug(f"Created schema: {schema}")
+    if not IS_MYSQL_COMPAT:
+        logger.debug(f"Creating schema: {schema}")
+        with pg_engine(database, echo=echo) as engine:
+            pg_execute(
+                engine, sa.text(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            )
+        logger.debug(f"Created schema: {schema}")
 
 
 def create_database(database: str, echo: bool = False) -> None:
     """Create a database."""
     logger.debug(f"Creating database: {database}")
-    with pg_engine("postgres", echo=echo) as engine:
+    with pg_engine(
+        MYSQL_DATABASE if IS_MYSQL_COMPAT else PG_DATABASE,
+        echo=echo,
+    ) as engine:
         pg_execute(
             engine,
-            sa.text(f'CREATE DATABASE "{database}"'),
+            sa.text(f"CREATE DATABASE {database}"),
             options={"isolation_level": "AUTOCOMMIT"},
         )
     logger.debug(f"Created database: {database}")
@@ -1233,10 +1520,12 @@ def create_database(database: str, echo: bool = False) -> None:
 def drop_database(database: str, echo: bool = False) -> None:
     """Drop a database."""
     logger.debug(f"Dropping database: {database}")
-    with pg_engine("postgres", echo=echo) as engine:
+    with pg_engine(
+        MYSQL_DATABASE if IS_MYSQL_COMPAT else PG_DATABASE, echo=echo
+    ) as engine:
         pg_execute(
             engine,
-            sa.text(f'DROP DATABASE IF EXISTS "{database}"'),
+            sa.text(f"DROP DATABASE IF EXISTS {database}"),
             options={"isolation_level": "AUTOCOMMIT"},
         )
     logger.debug(f"Dropped database: {database}")
@@ -1244,15 +1533,26 @@ def drop_database(database: str, echo: bool = False) -> None:
 
 def database_exists(database: str, echo: bool = False) -> bool:
     """Check if database is present."""
-    with pg_engine("postgres", echo=echo) as engine:
+    with pg_engine(
+        MYSQL_DATABASE if IS_MYSQL_COMPAT else PG_DATABASE,
+        echo=echo,
+    ) as engine:
         with engine.connect() as conn:
-            row = conn.execute(
-                sa.select(
-                    sa.text("1"),
+            if IS_MYSQL_COMPAT:
+                sql = sa.text(
+                    "SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA "
+                    "WHERE SCHEMA_NAME = :db LIMIT 1"
                 )
-                .select_from(sa.text("pg_database"))
-                .where(sa.column("datname") == database),
-            ).fetchone()
+                return conn.execute(sql, {"db": database}).first() is not None
+
+            else:
+                row = conn.execute(
+                    sa.select(
+                        sa.text("1"),
+                    )
+                    .select_from(sa.text("pg_database"))
+                    .where(sa.column("datname") == database),
+                ).fetchone()
         return row is not None
 
 

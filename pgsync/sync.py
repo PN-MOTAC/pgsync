@@ -12,24 +12,38 @@ import threading
 import time
 import typing as t
 from collections import defaultdict
+from itertools import groupby
 from pathlib import Path
 
 import click
+import pymysql
 import sqlalchemy as sa
 import sqlparse
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from pymysqlreplication import BinLogStreamReader
+from pymysqlreplication.event import FormatDescriptionEvent, RotateEvent
+from pymysqlreplication.row_event import (
+    DeleteRowsEvent,
+    UpdateRowsEvent,
+    WriteRowsEvent,
+)
+from redis.exceptions import ConnectionError
+
+from pgsync.base import pg_logical_repl_conn
+from pgsync.settings import IS_MYSQL_COMPAT
 
 from . import __version__, settings
 from .base import Base, Payload
 from .constants import (
     DELETE,
     INSERT,
+    JSONB_OPERATORS,
     MATERIALIZED_VIEW,
     MATERIALIZED_VIEW_COLUMNS,
     META,
     PRIMARY_KEY_DELIMITER,
-    TG_OP,
+    TG_OPS,
     TRUNCATE,
     UPDATE,
 )
@@ -53,12 +67,17 @@ from .utils import (
     compiled_query,
     config_loader,
     exception,
-    get_config,
+    format_number,
     MutuallyExclusiveOption,
+    remap_unknown,
     show_settings,
     threaded,
     Timer,
+    validate_config,
 )
+
+TX_BOUNDARY_RE = re.compile(r"^(BEGIN|COMMIT)\s+(\d+)", re.IGNORECASE)
+
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +88,7 @@ class Sync(Base, metaclass=Singleton):
     def __init__(
         self,
         doc: dict,
+        *,
         verbose: bool = False,
         validate: bool = True,
         repl_slots: bool = True,
@@ -76,6 +96,8 @@ class Sync(Base, metaclass=Singleton):
         num_workers: int = 1,
         producer: bool = True,
         consumer: bool = True,
+        bootstrap: bool = False,
+        wal: bool = False,
         **kwargs,
     ) -> None:
         """Constructor."""
@@ -94,28 +116,55 @@ class Sync(Base, metaclass=Singleton):
         self.__name: str = re.sub(
             "[^0-9a-zA-Z_]+", "", f"{self.database.lower()}_{self.index}"
         )
-        self._checkpoint: int = None
+        self._checkpoint: t.Optional[t.Union[str, int]] = None
         self._plugins: Plugins = None
         self._truncate: bool = False
-        self.producer = producer
-        self.consumer = consumer
+        self.producer: bool = producer
+        self.consumer: bool = consumer
         self.num_workers: int = num_workers
-        self._checkpoint_file: str = os.path.join(
-            settings.CHECKPOINT_PATH, f".{self.__name}"
+        # Redis not required in wal or polling mode
+        self._redis: t.Optional[RedisQueue] = None
+        self.tree: Tree = Tree(
+            self.models, nodes=self.nodes, database=doc["database"]
         )
-        self.redis: RedisQueue = RedisQueue(self.__name)
-        self.tree: Tree = Tree(self.models, nodes=self.nodes)
+
+        if bootstrap:
+            self.setup(polling=polling, wal=wal)
+
         if validate:
             self.validate(repl_slots=repl_slots, polling=polling)
             self.create_setting()
+
         if self.plugins:
             self._plugins: Plugins = Plugins("plugins", self.plugins)
+
         self.query_builder: QueryBuilder = QueryBuilder(verbose=verbose)
         self.count: dict = dict(xlog=0, db=0, redis=0)
         self.tasks: t.List[asyncio.Task] = []
-        self.lock = threading.Lock()
+        self.lock: threading.Lock = threading.Lock()
+        # holds Payload objects across multiple consume() calls
+        self._buffer: list["Payload"] = []
 
-    def validate(self, repl_slots: bool = True, polling=False) -> None:
+    @property
+    def slot_name(self) -> str:
+        """Return the replication slot name."""
+        return self.__name
+
+    @property
+    def checkpoint_file(self) -> str:
+        return os.path.join(settings.CHECKPOINT_PATH, f".{self.__name}")
+
+    @property
+    def redis(self) -> t.Optional[RedisQueue]:
+        """Return the Redis queue instance."""
+        if self._redis is None:
+            try:
+                self._redis = RedisQueue(self.__name)
+            except Exception:
+                pass
+        return self._redis
+
+    def validate(self, repl_slots: bool = True, polling: bool = False) -> None:
         """Perform all validation right away."""
 
         # ensure v2 compatible schema
@@ -129,7 +178,8 @@ class Sync(Base, metaclass=Singleton):
         if self.index is None:
             raise ValueError("Index is missing for doc")
 
-        if not polling:
+        # replication slot not needed in polling or mysql
+        if not self.is_mysql_compat and not polling:
             max_replication_slots: t.Optional[str] = self.pg_settings(
                 "max_replication_slots"
             )
@@ -166,7 +216,14 @@ class Sync(Base, metaclass=Singleton):
                     f'Make sure you have run the "bootstrap" command.'
                 )
 
-        if not settings.REDIS_CHECKPOINT:
+        if settings.REDIS_CHECKPOINT:
+            # ensure Redis is reachable
+            try:
+                self.redis.ping()
+            except ConnectionError:
+                raise
+
+        else:
             # ensure the checkpoint dirpath is valid
             if not Path(settings.CHECKPOINT_PATH).exists():
                 raise RuntimeError(
@@ -185,8 +242,8 @@ class Sync(Base, metaclass=Singleton):
         for node in self.tree.traverse_breadth_first():
             # ensure internal materialized view compatibility
             if MATERIALIZED_VIEW in self._materialized_views(node.schema):
-                if MATERIALIZED_VIEW_COLUMNS != self.columns(
-                    node.schema, MATERIALIZED_VIEW
+                if set(MATERIALIZED_VIEW_COLUMNS) != set(
+                    self.columns(node.schema, MATERIALIZED_VIEW)
                 ):
                     raise RuntimeError(
                         f"Required materialized view columns not present on "
@@ -267,8 +324,16 @@ class Sync(Base, metaclass=Singleton):
             routing=self.routing,
         )
 
-    def setup(self, no_create: bool = False) -> None:
-        """Create the database triggers and replication slot."""
+    def setup(
+        self, no_create: bool = False, polling: bool = False, wal: bool = False
+    ) -> None:
+        """Create the database triggers and replication slot.
+        Generally bootstrap should not require Redis as it is optional in certain cases.
+        """
+        if self.is_mysql_compat:
+            raise NotImplementedError(
+                "Setup is not supported for MySQL-family backend (MySQL or MariaDB)"
+            )
 
         if_not_exists: bool = not no_create
 
@@ -279,68 +344,101 @@ class Sync(Base, metaclass=Singleton):
         ):
             if if_not_exists:
 
-                self.teardown(drop_view=False)
+                self.teardown(drop_view=False, polling=polling, wal=wal)
 
-            for schema in self.schemas:
-                # TODO: move if_not_exists to the function
-                if if_not_exists or not self.function_exists(schema):
-
-                    self.create_function(schema)
-
-                tables: t.Set = set()
-                # tables with user defined foreign keys
-                user_defined_fkey_tables: dict = {}
-
-                for node in self.tree.traverse_breadth_first():
-                    if node.schema != schema:
+            if not polling and not wal:
+                for schema in self.schemas:
+                    if schema not in self.tree.schemas:
+                        logger.warning(
+                            f"Schema '{schema}' not found in node definitions. Skipping..."
+                        )
                         continue
-                    tables |= set(
-                        [
-                            through.table
-                            for through in node.relationship.throughs
-                        ]
-                    )
-                    tables |= set([node.table])
-                    # we also need to bootstrap the base tables
-                    tables |= set(node.base_tables)
 
-                    # we want to get both the parent and the child keys here
-                    # even though only one of them is the foreign_key.
-                    # this is because we define both in the schema but
-                    # do not specify which table is the foreign key.
-                    columns: list = []
-                    if node.relationship.foreign_key.parent:
-                        columns.extend(node.relationship.foreign_key.parent)
-                    if node.relationship.foreign_key.child:
-                        columns.extend(node.relationship.foreign_key.child)
-                    if columns:
-                        user_defined_fkey_tables.setdefault(node.table, set())
-                        user_defined_fkey_tables[node.table] |= set(columns)
-                if tables:
-                    if if_not_exists or not self.view_exists(
-                        MATERIALIZED_VIEW, schema
-                    ):
+                    # TODO: move if_not_exists to the function
+                    if if_not_exists or not self.function_exists(schema):
 
-                        self.create_view(
-                            self.index,
+                        self.create_function(schema)
+
+                    tables: t.Set = set()
+                    # tables with user defined foreign keys
+                    user_defined_fkey_tables: dict = {}
+                    node_columns: dict = {}
+
+                    for node in self.tree.traverse_breadth_first():
+                        if node.schema != schema:
+                            continue
+                        tables |= set(
+                            [
+                                through.table
+                                for through in node.relationship.throughs
+                            ]
+                        )
+                        tables |= set([node.table])
+                        # we also need to bootstrap the base tables
+                        tables |= set(node.base_tables)
+                        node_columns[node.table] = set(
+                            [
+                                re.split(
+                                    rf"\s*({'|'.join(re.escape(op) for op in JSONB_OPERATORS)})\s*",
+                                    c,
+                                    maxsplit=1,
+                                )[0]
+                                for c in node.column_names
+                            ]
+                        )
+                        # we want to get both the parent and the child keys here
+                        # even though only one of them is the foreign_key.
+                        # this is because we define both in the schema but
+                        # do not specify which table is the foreign key.
+                        columns: list = []
+                        if node.relationship.foreign_key.parent:
+                            columns.extend(
+                                node.relationship.foreign_key.parent
+                            )
+                        if node.relationship.foreign_key.child:
+                            columns.extend(node.relationship.foreign_key.child)
+                        if columns:
+                            user_defined_fkey_tables.setdefault(
+                                node.table, set()
+                            )
+                            user_defined_fkey_tables[node.table] |= set(
+                                columns
+                            )
+                    if tables:
+                        if if_not_exists or not self.view_exists(
+                            MATERIALIZED_VIEW, schema
+                        ):
+                            self.create_view(
+                                self.index,
+                                schema,
+                                tables,
+                                user_defined_fkey_tables,
+                                node_columns,
+                            )
+
+                        self.create_triggers(
                             schema,
-                            tables,
-                            user_defined_fkey_tables,
+                            tables=tables,
+                            join_queries=join_queries,
+                            if_not_exists=if_not_exists,
                         )
 
-                    self.create_triggers(
-                        schema,
-                        tables=tables,
-                        join_queries=join_queries,
-                        if_not_exists=if_not_exists,
-                    )
+            if not polling:
+                if if_not_exists or not self.replication_slots(self.__name):
 
-            if if_not_exists or not self.replication_slots(self.__name):
+                    self.create_replication_slot(self.__name)
 
-                self.create_replication_slot(self.__name)
-
-    def teardown(self, drop_view: bool = True) -> None:
+    def teardown(
+        self,
+        drop_view: bool = True,
+        polling: bool = False,
+        wal: bool = False,
+    ) -> None:
         """Drop the database triggers and replication slot."""
+        if self.is_mysql_compat:
+            raise NotImplementedError(
+                "Teardown is not supported for MySQL-family backend (MySQL or MariaDB)"
+            )
 
         join_queries: bool = settings.JOIN_QUERIES
 
@@ -348,34 +446,50 @@ class Sync(Base, metaclass=Singleton):
             self.database, max_retries=None, retry_interval=0.1
         ):
             try:
-                os.unlink(self._checkpoint_file)
+                os.unlink(self.checkpoint_file)
             except (OSError, FileNotFoundError):
                 logger.warning(
-                    f"Checkpoint file not found: {self._checkpoint_file}"
+                    f"Checkpoint file not found: {self.checkpoint_file}"
                 )
 
-            self.redis.delete()
-
-            for schema in self.schemas:
-                tables: t.Set = set()
-                for node in self.tree.traverse_breadth_first():
-                    tables |= set(
-                        [
-                            through.table
-                            for through in node.relationship.throughs
-                        ]
+            if not wal and not settings.REDIS_CHECKPOINT:
+                try:
+                    if self.redis is None:
+                        raise RuntimeError("Redis is not configured.")
+                    self.redis.delete()
+                except Exception as e:
+                    logger.warning(
+                        f"Could not clear Redis checkpoint queue: {e}"
                     )
-                    tables |= set([node.table])
-                    # we also need to teardown the base tables
-                    tables |= set(node.base_tables)
-                self.drop_triggers(
-                    schema=schema, tables=tables, join_queries=join_queries
-                )
-                if drop_view:
-                    self.drop_view(schema)
-                    self.drop_function(schema)
 
-            self.drop_replication_slot(self.__name)
+            if not polling and not wal:
+                for schema in self.schemas:
+                    if schema not in self.tree.schemas:
+                        logger.warning(
+                            f"Schema '{schema}' not found in node definitions. Skipping..."
+                        )
+                        continue
+
+                    tables: t.Set = set()
+                    for node in self.tree.traverse_breadth_first():
+                        tables |= set(
+                            [
+                                through.table
+                                for through in node.relationship.throughs
+                            ]
+                        )
+                        tables |= set([node.table])
+                        # we also need to teardown the base tables
+                        tables |= set(node.base_tables)
+                    self.drop_triggers(
+                        schema=schema, tables=tables, join_queries=join_queries
+                    )
+                    if drop_view:
+                        self.drop_view(schema)
+                        self.drop_function(schema)
+
+            if not polling:
+                self.drop_replication_slot(self.__name)
 
     def get_doc_id(self, primary_keys: t.List[str], table: str) -> str:
         """
@@ -387,15 +501,33 @@ class Sync(Base, metaclass=Singleton):
             )
         return f"{PRIMARY_KEY_DELIMITER}".join(map(str, primary_keys))
 
+    def log_xlog_progress(
+        self, current: int, total: int, bar_length: int = 100
+    ) -> None:
+        """
+        Render a single-line, in-place progress update for WAL streaming.
+        """
+        # prevent division by zero
+        percent: float = (current / total * 100) if total else 0.0
+        filled: int = int(bar_length * current // total) if total else 0
+        bar: str = "=" * filled + "-" * (bar_length - filled)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        sys.stdout.write(
+            f"\r{timestamp} WAL {self.database}:{self.index} "
+            f"[{bar}] {format_number(current):>12}/{format_number(total):<12} ({percent:6.2f}%)"
+        )
+        sys.stdout.flush()
+
     def logical_slot_changes(
         self,
         txmin: t.Optional[int] = None,
         txmax: t.Optional[int] = None,
-        upto_nchanges: t.Optional[int] = None,
         upto_lsn: t.Optional[str] = None,
+        logical_slot_chunk_size: t.Optional[int] = None,
     ) -> None:
         """
-        Process changes from the db logical replication logs.
+        Stream through the slot in pages of logical_slot_chunk_size,
+        grouping consecutive rows with the same (tg_op, table).
 
         Here, we are grouping all rows of the same table and tg_op
         and processing them as a group in bulk.
@@ -417,164 +549,534 @@ class Sync(Base, metaclass=Singleton):
         TODO: We can also process all INSERTS together and rearrange
         them as done below
         """
-        # minimize the tmp file disk usage when calling
-        # PG_LOGICAL_SLOT_PEEK_CHANGES and PG_LOGICAL_SLOT_GET_CHANGES
-        # by limiting to a smaller batch size.
+        offset: int = 0
+        limit: int = (
+            logical_slot_chunk_size or settings.LOGICAL_SLOT_CHUNK_SIZE
+        )
+        current: int = 0
+        total: int = self.logical_slot_count_changes(
+            self.__name,
+            txmin=txmin,
+            txmax=txmax,
+            upto_lsn=upto_lsn,
+        )
         while True:
-            changes: int = self.logical_slot_peek_changes(
-                self.__name,
+            # peek one page of up to limit rows
+            raw: t.List[sa.engine.row.Row] = self.logical_slot_peek_changes(
+                slot_name=self.__name,
                 txmin=txmin,
                 txmax=txmax,
-                upto_nchanges=upto_nchanges,
                 upto_lsn=upto_lsn,
+                limit=limit,
+                offset=offset,
             )
-            if not changes:
+            if not raw:
                 break
+            offset += limit
 
-            rows: list = []
-            for row in changes:
-                if re.search(r"^BEGIN", row.data) or re.search(
-                    r"^COMMIT", row.data
-                ):
-                    continue
-                rows.append(row)
-
+            # parse and filter out BEGIN/COMMIT and unwanted schemas
             payloads: t.List[Payload] = []
-            for i, row in enumerate(rows):
-                logger.debug(f"txid: {row.xid}")
-                logger.debug(f"data: {row.data}")
-                # TODO: optimize this so we are not parsing the same row twice
+            for row in raw:
+                if TX_BOUNDARY_RE.match(row.data):
+                    continue
                 try:
                     payload: Payload = self.parse_logical_slot(row.data)
-                except Exception as e:
-                    logger.exception(
-                        f"Error parsing row: {e}\nRow data: {row.data}"
-                    )
+                except Exception:
+                    logger.exception(f"Error parsing row: {row.data}")
                     raise
+                if payload.schema in self.tree.schemas:
+                    payloads.append(payload)
 
-                # filter out unknown schemas
-                if payload.schema not in self.tree.schemas:
+            if payloads:
+                # bulk-index each consecutive run of (tg_op, table)
+                for (op, tbl), run in groupby(
+                    payloads,
+                    key=lambda payload: (payload.tg_op, payload.table),
+                ):
+                    batch: list = list(run)
+                    logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
+                    current += len(batch)
+                    self.log_xlog_progress(current, total, bar_length=30)
+                    self.search_client.bulk(self.index, self._payloads(batch))
+                    self.count["xlog"] += len(batch)
+
+        # mark those rows consumed
+        self.logical_slot_get_changes(
+            slot_name=self.__name,
+            txmin=txmin,
+            txmax=txmax,
+            upto_lsn=upto_lsn,
+        )
+        self.checkpoint = txmax or self.txid_current
+
+    def _xlog_progress(self, current: int, total: t.Optional[int]) -> None:
+        try:
+            self.log_xlog_progress(current, total, bar_length=30)
+        except Exception:
+            pass
+
+    def binlog_changes(
+        self,
+        start_log: t.Optional[str] = None,
+        start_pos: t.Optional[int] = None,
+        server_id: int = 9991,
+        binlog_chunk_size: t.Optional[int] = None,
+        blocking: bool = False,
+    ) -> None:
+        """Stream MySQL/MariaDB row events and process."""
+        limit: int = binlog_chunk_size or settings.LOGICAL_SLOT_CHUNK_SIZE
+        allowed_schemas: t.Set = {
+            s.lower() for s in (getattr(self.tree, "schemas", []) or [])
+        }
+
+        # Detect MariaDB from SQLAlchemy engine
+        with self.engine.connect() as conn:
+            is_mariadb: bool = getattr(conn.dialect, "is_mariadb", False)
+
+        def _conn_settings_from_engine(engine: sa.Engine) -> dict:
+            url: sa.engine.URL = engine.url
+            return {
+                "host": url.host,
+                "port": int(url.port),
+                "user": url.username,
+                "passwd": url.password or "",
+                "charset": "utf8mb4",
+                "autocommit": True,
+            }
+
+        base: dict = _conn_settings_from_engine(self.engine)
+        connection_settings: dict = dict(base)  # replication socket
+        ctl_connection_settings: dict = dict(base)
+        ctl_connection_settings["cursorclass"] = (
+            pymysql.cursors.Cursor
+        )  # tuple rows
+
+        stream: BinLogStreamReader = BinLogStreamReader(
+            connection_settings=connection_settings,
+            ctl_connection_settings=ctl_connection_settings,  # separate control socket w/ tuple cursor
+            server_id=server_id,
+            is_mariadb=is_mariadb,
+            log_file=start_log,  # None => server current file
+            log_pos=int(start_pos or 4),  # must be the "next event" position
+            resume_stream=True,
+            blocking=blocking,
+            only_events=[
+                FormatDescriptionEvent,
+                RotateEvent,
+                WriteRowsEvent,
+                UpdateRowsEvent,
+                DeleteRowsEvent,
+            ],
+            freeze_schema=False,
+        )
+
+        current: int = 0
+        total: t.Optional[int] = None
+        batch: list = []
+        last_key: t.Optional[tuple[str, str]] = None
+        batch_limit: int = limit
+
+        # Single-save checkpoint snapshot
+        save_file: t.Optional[str] = start_log
+        save_pos: int = int(start_pos or 4)
+
+        try:
+            for event in stream:
+                # Snapshot the stream cursor FIRST so skips still advance checkpoint
+                if getattr(stream, "log_file", None):
+                    save_file = stream.log_file
+                if getattr(stream, "log_pos", None):
+                    save_pos = int(stream.log_pos)
+
+                # Handle rotation immediately
+                if isinstance(event, RotateEvent):
+                    next_binlog = event.next_binlog
+                    save_file = (
+                        next_binlog.decode()
+                        if isinstance(next_binlog, (bytes, bytearray))
+                        else next_binlog
+                    )
+                    save_pos = int(getattr(event, "position", 4) or 4)
                     continue
 
-                payloads.append(payload)
+                schema: str = (getattr(event, "schema", "") or "").lower()
+                table: str = (getattr(event, "table", "") or "").lower()
+                if allowed_schemas and schema not in allowed_schemas:
+                    continue
 
-                j: int = i + 1
-                if j < len(rows):
-                    try:
-                        payload2: Payload = self.parse_logical_slot(
-                            rows[j].data
+                # Build payloads
+                if isinstance(event, WriteRowsEvent):
+                    for row in event.rows:
+                        payload = Payload(
+                            schema=schema,
+                            table=table,
+                            tg_op="INSERT",
+                            new=remap_unknown(
+                                self.engine, schema, table, row.get("values")
+                            ),
                         )
-                    except Exception as e:
-                        logger.exception(
-                            f"Error parsing row: {e}\nRow data: {rows[j].data}"
-                        )
-                        raise
+                        key: tuple[str, str] = (payload.tg_op, payload.table)
+                        if last_key is None or key == last_key:
+                            batch.append(payload)
+                        else:
+                            self._flush_batch(last_key, batch)
+                            batch = [payload]
+                        last_key = key
+                        current += 1
+                        self._xlog_progress(current, total)
 
-                    if (
-                        payload.tg_op != payload2.tg_op
-                        or payload.table != payload2.table
-                    ):
-                        self.search_client.bulk(
-                            self.index, self._payloads(payloads)
+                elif isinstance(event, UpdateRowsEvent):
+                    for row in event.rows:
+                        payload = Payload(
+                            schema=schema,
+                            table=table,
+                            tg_op="UPDATE",
+                            old=remap_unknown(
+                                self.engine,
+                                schema,
+                                table,
+                                row.get("before_values"),
+                            ),
+                            new=remap_unknown(
+                                self.engine,
+                                schema,
+                                table,
+                                row.get("after_values"),
+                            ),
                         )
-                        payloads: list = []
-                elif j == len(rows):
-                    self.search_client.bulk(
-                        self.index, self._payloads(payloads)
-                    )
-                    payloads: list = []
-            self.logical_slot_get_changes(
-                self.__name,
-                txmin=txmin,
-                txmax=txmax,
-                upto_nchanges=upto_nchanges,
-                upto_lsn=upto_lsn,
-            )
-            with self.lock:
-                self.count["xlog"] += len(rows)
+                        key = (payload.tg_op, payload.table)
+                        if last_key is None or key == last_key:
+                            batch.append(payload)
+                        else:
+                            self._flush_batch(last_key, batch)
+                            batch = [payload]
+                        last_key = key
+                        current += 1
+                        self._xlog_progress(current, total)
+
+                elif isinstance(event, DeleteRowsEvent):
+                    for row in event.rows:
+                        payload = Payload(
+                            schema=schema,
+                            table=table,
+                            tg_op="DELETE",
+                            old=remap_unknown(
+                                self.engine, schema, table, row.get("values")
+                            ),
+                        )
+                        key = (payload.tg_op, payload.table)
+                        if last_key is None or key == last_key:
+                            batch.append(payload)
+                        else:
+                            self._flush_batch(last_key, batch)
+                            batch = [payload]
+                        last_key = key
+                        current += 1
+                        self._xlog_progress(current, total)
+
+                if batch_limit and last_key and len(batch) >= batch_limit:
+                    self._flush_batch(last_key, batch)
+                    batch = []
+                    last_key = None
+
+        finally:
+            if last_key and batch:
+                self._flush_batch(last_key, batch)
+            # Single checkpoint save using the stream’s authoritative cursor
+            if getattr(stream, "log_file", None):
+                save_file = stream.log_file
+            if getattr(stream, "log_pos", None):
+                save_pos = int(stream.log_pos)
+            stream.close()
+            if save_file:
+                self.checkpoint = f"{save_file},{save_pos}"
+
+    def _flush_batch(self, last_key: tuple[str, str], batch: list) -> None:
+        if not batch:
+            return
+        self.search_client.bulk(self.index, self._payloads(batch))
+        self.count["xlog"] = self.count.get("xlog", 0) + len(batch)
 
     def _root_primary_key_resolver(
-        self, node: Node, payload: Payload, filters: list
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        filters: list,
     ) -> list:
-        fields: dict = defaultdict(list)
-        primary_values: list = [
-            payload.data[key] for key in node.model.primary_keys
-        ]
-        primary_fields: dict = dict(
-            zip(node.model.primary_keys, primary_values)
+        """
+        Batched resolver for rows identifiable by the node's primary key(s).
+
+        - Accumulates distinct PK values across payloads
+        - Greedily chunks so no per-field 'terms' list exceeds max_terms_count
+        - Issues one search per chunk and de-dupes doc_ids
+        """
+        if not payloads:
+            return filters
+
+        pk_names = list(getattr(node.model, "primary_keys", []) or [])
+        if not pk_names:
+            return filters
+
+        # Respect index.max_terms_count; allow override at self or search_client level
+        max_terms = int(
+            getattr(
+                self,
+                "max_terms_count",
+                getattr(self.search_client, "max_terms_count", 65536),
+            )
         )
-        for key, value in primary_fields.items():
-            fields[key].append(value)
-        for doc_id in self.search_client._search(
-            self.index, node.table, fields
-        ):
-            where: dict = {}
-            params: dict = doc_id.split(PRIMARY_KEY_DELIMITER)
-            for i, key in enumerate(self.tree.root.model.primary_keys):
-                where[key] = params[i]
-            filters.append(where)
+        if max_terms <= 0:
+            max_terms = 65536
+
+        # Current chunk state: ordered unique values per PK
+        current_vals = {pk: [] for pk in pk_names}
+        current_seen = {pk: set() for pk in pk_names}
+        seen_docs = set()
+
+        def flush_chunk():
+            """Execute search for the current chunk and reset buffers."""
+            # Build fields only for PKs that have values in this chunk
+            fields = {pk: vals for pk, vals in current_vals.items() if vals}
+            if not fields:
+                return
+
+            for doc_id in self.search_client._search(
+                self.index, node.table, fields
+            ):
+                if doc_id in seen_docs:
+                    continue
+                seen_docs.add(doc_id)
+
+                parts = doc_id.split(PRIMARY_KEY_DELIMITER)
+                # Map root PKs in order
+                where = {}
+                if len(parts) == len(self.tree.root.model.primary_keys):
+                    for i, key in enumerate(self.tree.root.model.primary_keys):
+                        where[key] = parts[i]
+                    filters.append(where)
+                else:
+                    logger.warning(
+                        f"Skipping malformed doc_id: {doc_id}. "
+                        f"Expected {len(self.tree.root.model.primary_keys)} parts, got {len(parts)}"
+                    )
+
+            # reset chunk
+            for pk in pk_names:
+                current_vals[pk].clear()
+                current_seen[pk].clear()
+
+        for payload in payloads:
+            data = getattr(payload, "data", {}) or {}
+            if not isinstance(data, dict):
+                continue
+
+            # Collect PK values present in this payload
+            pv = {}
+            for pk in pk_names:
+                if pk in data:
+                    v = data[pk]
+                    pv[pk] = v
+
+            if not pv:
+                continue
+
+            # If adding this payload's PK values would overflow any terms list, flush first
+            overflow = any(
+                (v not in current_seen[pk])
+                and (len(current_vals[pk]) + 1 > max_terms)
+                for pk, v in pv.items()
+            )
+            if overflow:
+                flush_chunk()
+
+            # Add this payload's PK values to the current chunk (deduped per field)
+            for pk, v in pv.items():
+                if v not in current_seen[pk]:
+                    current_seen[pk].add(v)
+                    current_vals[pk].append(v)
+
+        # Flush remaining
+        flush_chunk()
 
         return filters
 
     def _root_foreign_key_resolver(
-        self, node: Node, payload: Payload, foreign_keys: dict, filters: list
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        foreign_keys: dict,
+        filters: list,
     ) -> list:
         """
-        Foreign key resolver logic:
-
-        This resolver handles n-tiers relationships (n > 3) where we
-        insert/update a new leaf node.
-        For the node's parent, get the primary keys values from the
-        incoming payload.
-        Lookup this value in the meta section of Elasticsearch/OpenSearch
-        Then get the root node returned and re-sync that root record.
-        Essentially, we want to lookup the root node affected by
-        our insert/update operation and sync the tree branch for that root.
+        Batched FK resolver with chunking to respect ES/OpenSearch terms limits.
+        Splits large value sets into chunks so that each field's terms list
+        is <= max_terms_count (defaults to 65536).
         """
-        fields: dict = defaultdict(list)
-        foreign_values: list = [
-            payload.new.get(key) for key in foreign_keys[node.name]
-        ]
-        for key in [key.name for key in node.primary_keys]:
-            for value in foreign_values:
-                if value:
-                    fields[key].append(value)
-        # TODO: we should combine this with the filter above
-        # so we only hit Elasticsearch/OpenSearch once
-        for doc_id in self.search_client._search(
-            self.index,
-            node.parent.table,
-            fields,
-        ):
-            where: dict = {}
-            params: dict = doc_id.split(PRIMARY_KEY_DELIMITER)
-            for i, key in enumerate(self.tree.root.model.primary_keys):
-                where[key] = params[i]
-            filters.append(where)
+        if not payloads:
+            return filters
+
+        fk_names = foreign_keys.get(node.name, [])
+        if not fk_names:
+            return filters
+
+        # Gather distinct FK values across payloads (preserve order).
+        seen_vals = set()
+        foreign_values = []
+        for p in payloads:
+            new_obj = getattr(p, "new", {}) or {}
+            for key in fk_names:
+                v = new_obj.get(key)
+                if v is not None and v not in seen_vals:
+                    seen_vals.add(v)
+                    foreign_values.append(v)
+
+        if not foreign_values:
+            return filters
+
+        # Determine max terms per field (allow override from instance/search client).
+        max_terms = int(
+            getattr(
+                self,
+                "max_terms_count",
+                getattr(self.search_client, "max_terms_count", 65536),
+            )
+        )
+        if max_terms <= 0:
+            max_terms = 65536  # sane fallback
+
+        seen_docs = set()
+
+        # For each chunk, build a fields dict mapping *each* PK name -> chunked values,
+        # mirroring your original semantics.
+        pk_names = [k.name for k in node.primary_keys]
+        for chunk in chunks(foreign_values, max_terms):
+            fields = {pk: list(chunk) for pk in pk_names}
+
+            for doc_id in self.search_client._search(
+                self.index, node.parent.table, fields
+            ):
+                if doc_id in seen_docs:
+                    continue
+                seen_docs.add(doc_id)
+
+                parts = doc_id.split(PRIMARY_KEY_DELIMITER)
+                # skip malformed doc_ids that don't match root PK arity
+                if len(parts) != len(self.tree.root.model.primary_keys):
+                    logger.warning(
+                        f"Skipping malformed doc_id: {doc_id}. "
+                        f"Expected {len(self.tree.root.model.primary_keys)} parts, got {len(parts)}"
+                    )
+                    continue
+
+                where: dict = {}
+                for i, key in enumerate(self.tree.root.model.primary_keys):
+                    where[key] = parts[i]
+                filters.append(where)
 
         return filters
 
     def _through_node_resolver(
-        self, node: Node, payload: Payload, filters: list
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        filters: list,
     ) -> list:
-        """Handle where node is a through table with a direct references to
-        root
         """
-        foreign_key_constraint = payload.foreign_key_constraint(node.model)
-        if self.tree.root.name in foreign_key_constraint:
-            filters.append(
-                {
-                    foreign_key_constraint[self.tree.root.name][
-                        "remote"
-                    ]: foreign_key_constraint[self.tree.root.name]["value"]
-                }
-            )
+        Handle where node is a through table with a direct references to root
+        Batched resolver for through tables that directly reference the root.
+
+        For each payload, if it carries a foreign key to the root, append a
+        {remote_field: value} filter. Deduplicates to avoid redundant entries.
+        """
+        if not payloads:
+            return filters
+
+        root_name = self.tree.root.name
+        seen = set()  # (remote, value)
+
+        for p in payloads:
+            try:
+                fkc = p.foreign_key_constraint(node.model) or {}
+            except Exception:
+                # if a payload can't produce constraints, skip it
+                continue
+
+            ref = fkc.get(root_name)
+            if not ref:
+                continue
+
+            remote = ref.get("remote")
+            value = ref.get("value")
+
+            if remote and value is not None:
+                key = (remote, value)
+                if key not in seen:
+                    seen.add(key)
+                    filters.append({remote: value})
+
         return filters
 
     def _insert_op(
         self, node: Node, filters: dict, payloads: t.List[Payload]
     ) -> dict:
-        if node.table in self.tree.tables:
+        if node.is_through:
+
+            # handle case where we insert into a through table
+            # set the parent as the new entity that has changed
+            foreign_keys = self.query_builder.get_foreign_keys(
+                node.parent,
+                node,
+            )
+
+            # if the node is directly related to parent and share a common field name
+            for payload in payloads:
+                columns = foreign_keys.get(node.name, [])
+                for column in columns:
+                    if column in payload.data:
+                        filters[node.parent.table].append(
+                            {column: payload.data[column]}
+                        )
+
+            # find all Elasticsearch/OpenSearch docs with fields
+            # that match the filters and add their root to the query filter
+            """
+            +------+
+            | Root |
+            |------|
+            | id   |
+            | ...  |
+            +------+
+                |
+                | 1..*
+                v
+            +---------+        +---------------+        +---------+
+            |  NodeA  | 1    * |  ThroughTable | *    1 |  NodeB  |
+            |---------|--------|---------------|--------|---------|
+            | id      |        | nodeA_id      |        | id      |
+            | ...     |        | nodeB_id      |        | ...     |
+            +---------+        +---------------+        +---------+
+            NodeA represents the grandparent from through table
+            NodeB represents the parent from through table
+            ThroughTable represents the relationship between NodeA and NodeB
+
+            """
+            _filters: list = []
+            _filters = self._root_primary_key_resolver(
+                node.parent, payloads, _filters
+            )
+            if node.parent.parent:
+                _filters = self._root_primary_key_resolver(
+                    node.parent.parent, payloads, _filters
+                )
+            if _filters:
+                filters[self.tree.root.table].extend(_filters)
+
+            # also check through table with a direct references to root
+            _filters = self._through_node_resolver(node, payloads, _filters)
+            if _filters:
+                filters[self.tree.root.table].extend(_filters)
+
+        elif node.table in self.tree.tables:
             if node.is_root:
                 for payload in payloads:
                     primary_values = [
@@ -606,7 +1108,6 @@ class Sync(Base, metaclass=Singleton):
                         node,
                     )
 
-                _filters: list = []
                 for payload in payloads:
                     for node_key in foreign_keys[node.name]:
                         for parent_key in foreign_keys[node.parent.name]:
@@ -615,31 +1116,18 @@ class Sync(Base, metaclass=Singleton):
                                     {parent_key: payload.data[node_key]}
                                 )
 
-                    _filters = self._root_foreign_key_resolver(
-                        node, payload, foreign_keys, _filters
-                    )
+                _filters: list = []
+                _filters = self._root_foreign_key_resolver(
+                    node, payloads, foreign_keys, _filters
+                )
 
-                    # also check through table with a direct references to root
-                    _filters = self._through_node_resolver(
-                        node, payload, _filters
-                    )
+                # also check through table with a direct references to root
+                _filters = self._through_node_resolver(
+                    node, payloads, _filters
+                )
 
                 if _filters:
                     filters[self.tree.root.table].extend(_filters)
-
-        else:
-            # handle case where we insert into a through table
-            # set the parent as the new entity that has changed
-            foreign_keys = self.query_builder.get_foreign_keys(
-                node.parent,
-                node,
-            )
-
-            for payload in payloads:
-                for i, key in enumerate(foreign_keys[node.name]):
-                    filters[node.parent.table].append(
-                        {foreign_keys[node.parent.name][i]: payload.data[key]}
-                    )
 
         return filters
 
@@ -703,30 +1191,28 @@ class Sync(Base, metaclass=Singleton):
 
         else:
             # update the child tables
-            for payload in payloads:
-                _filters: list = []
-                _filters = self._root_primary_key_resolver(
-                    node, payload, _filters
-                )
-                # also handle foreign_keys
-                if node.parent:
-                    try:
-                        foreign_keys = self.query_builder.get_foreign_keys(
-                            node.parent,
-                            node,
-                        )
-                    except ForeignKeyError:
-                        foreign_keys = self.query_builder._get_foreign_keys(
-                            node.parent,
-                            node,
-                        )
-
-                    _filters = self._root_foreign_key_resolver(
-                        node, payload, foreign_keys, _filters
+            _filters: list = []
+            _filters = self._root_primary_key_resolver(
+                node, payloads, _filters
+            )
+            foreign_keys = []
+            if node.parent:
+                try:
+                    foreign_keys = self.query_builder.get_foreign_keys(
+                        node.parent,
+                        node,
+                    )
+                except ForeignKeyError:
+                    foreign_keys = self.query_builder._get_foreign_keys(
+                        node.parent,
+                        node,
                     )
 
-                if _filters:
-                    filters[self.tree.root.table].extend(_filters)
+            _filters = self._root_foreign_key_resolver(
+                node, payloads, foreign_keys, _filters
+            )
+            if _filters:
+                filters[self.tree.root.table].extend(_filters)
 
         return filters
 
@@ -775,13 +1261,12 @@ class Sync(Base, metaclass=Singleton):
             # when deleting the child node, find the doc _id where
             # the child keys match in private, then get the root doc_id and
             # re-sync the child tables
-            for payload in payloads:
-                _filters: list = []
-                _filters = self._root_primary_key_resolver(
-                    node, payload, _filters
-                )
-                if _filters:
-                    filters[self.tree.root.table].extend(_filters)
+            _filters: list = []
+            _filters = self._root_primary_key_resolver(
+                node, payloads, _filters
+            )
+            if _filters:
+                filters[self.tree.root.table].extend(_filters)
 
         return filters
 
@@ -808,15 +1293,21 @@ class Sync(Base, metaclass=Singleton):
             for doc_id in self.search_client._search(self.index, node.table):
                 where: dict = {}
                 params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                for i, key in enumerate(self.tree.root.model.primary_keys):
-                    where[key] = params[i]
-                _filters.append(where)
+                if len(params) == len(self.tree.root.model.primary_keys):
+                    for i, key in enumerate(self.tree.root.model.primary_keys):
+                        where[key] = params[i]
+                    _filters.append(where)
+                else:
+                    logger.warning(
+                        f"Skipping malformed doc_id: {doc_id}. "
+                        f"Expected {len(self.tree.root.model.primary_keys)} parts, got {len(params)}"
+                    )
             if _filters:
                 filters[self.tree.root.table].extend(_filters)
 
         return filters
 
-    def _payloads(self, payloads: t.List[Payload]) -> None:
+    def _payloads(self, payloads: t.List[Payload]) -> t.Generator:
         """
         The "payloads" is a list of payload operations to process together.
 
@@ -848,7 +1339,7 @@ class Sync(Base, metaclass=Singleton):
 
         """
         payload: Payload = payloads[0]
-        if payload.tg_op not in TG_OP:
+        if payload.tg_op not in TG_OPS:
             logger.exception(f"Unknown tg_op {payload.tg_op}")
             raise InvalidTGOPError(f"Unknown tg_op {payload.tg_op}")
 
@@ -974,7 +1465,7 @@ class Sync(Base, metaclass=Singleton):
         ctid: t.Optional[dict] = None,
     ) -> t.Generator:
         """
-        Synchronizes data from PostgreSQL to Elasticsearch.
+        Synchronizes data from PostgreSQL/MySQL/MariaDB to Elasticsearch/OpenSearch.
 
         Args:
             filters (Optional[dict]): A dictionary of filters to apply to the data.
@@ -983,7 +1474,7 @@ class Sync(Base, metaclass=Singleton):
             ctid (Optional[dict]): A dictionary of ctid values to include in the synchronization.
 
         Yields:
-            dict: A dictionary representing a doc to be indexed in Elasticsearch.
+            dict: A dictionary representing a doc to be indexed in Elasticsearch/OpenSearch.
         """
         self.query_builder.isouter = True
         self.query_builder.from_obj = None
@@ -1004,82 +1495,67 @@ class Sync(Base, metaclass=Singleton):
         if self.verbose:
             compiled_query(node._subquery, "Query")
 
-        count: int = self.fetchcount(node._subquery)
+        for i, (keys, row, primary_keys) in enumerate(
+            self.fetchmany(node._subquery)
+        ):
+            row: dict = Transform.transform(row, self.nodes)
 
-        with click.progressbar(
-            length=count,
-            show_pos=True,
-            show_percent=True,
-            show_eta=True,
-            fill_char="=",
-            empty_char="-",
-            width=50,
-        ) as bar:
-            for i, (keys, row, primary_keys) in enumerate(
-                self.fetchmany(node._subquery)
-            ):
-                bar.update(1)
+            row[META] = Transform.get_primary_keys(keys)
 
-                row: dict = Transform.transform(row, self.nodes)
-
-                row[META] = Transform.get_primary_keys(keys)
-
-                if node.is_root:
-                    primary_key_values: t.List[str] = list(
-                        map(str, primary_keys)
-                    )
-                    primary_key_names: t.List[str] = [
-                        primary_key.name for primary_key in node.primary_keys
-                    ]
-                    # TODO: add support for composite pkeys
-                    row[META][node.table] = {
-                        primary_key_names[0]: [primary_key_values[0]],
-                    }
-
-                if self.verbose:
-                    print(f"{(i+1)})")
-                    print(f"pkeys: {primary_keys}")
-                    pprint.pprint(row)
-                    print("-" * 10)
-
-                doc: dict = {
-                    "_id": self.get_doc_id(primary_keys, node.table),
-                    "_index": self.index,
-                    "_source": row,
+            if node.is_root:
+                primary_key_values: t.List[str] = list(map(str, primary_keys))
+                primary_key_names: t.List[str] = [
+                    primary_key.name for primary_key in node.primary_keys
+                ]
+                # TODO: add support for composite pkeys
+                row[META][node.table] = {
+                    primary_key_names[0]: [primary_key_values[0]],
                 }
 
-                if self.routing:
-                    doc["_routing"] = row[self.routing]
+            if self.verbose:
+                print(f"{(i + 1)})")
+                print(f"pkeys: {primary_keys}")
+                pprint.pprint(row)
+                print("-" * 10)
 
-                if (
-                    self.search_client.major_version < 7
-                    and not self.search_client.is_opensearch
-                ):
-                    doc["_type"] = "_doc"
+            doc: dict = {
+                "_id": self.get_doc_id(primary_keys, node.table),
+                "_index": self.index,
+                "_source": row,
+            }
 
-                if self._plugins:
-                    doc = next(self._plugins.transform([doc]))
-                    if not doc:
-                        continue
+            if self.routing:
+                doc["_routing"] = row[self.routing]
 
-                if self.pipeline:
-                    doc["pipeline"] = self.pipeline
+            if (
+                self.search_client.major_version < 7
+                and not self.search_client.is_opensearch
+            ):
+                doc["_type"] = "_doc"
 
-                yield doc
+            if self._plugins:
+                doc = next(self._plugins.transform([doc]))
+                if not doc:
+                    continue
+
+            if self.pipeline:
+                doc["pipeline"] = self.pipeline
+
+            yield doc
 
     @property
-    def checkpoint(self) -> int:
+    def checkpoint(self) -> t.Union[str, int]:
         """
-        Gets the current checkpoint value.
+        Gets the current checkpoint value from file or Redis/Valkey.
 
         :return: The current checkpoint value.
-        :rtype: int
+        :rtype: int or str
         """
         raw: t.Optional[str]
         if settings.REDIS_CHECKPOINT:
             raw = self.redis.get_meta(default={}).get("checkpoint")
         else:
-            path = Path(self._checkpoint_file)
+            path: Path = Path(self.checkpoint_file)
             raw = (
                 path.read_text(encoding="utf-8").split()[0]
                 if path.exists()
@@ -1089,15 +1565,41 @@ class Sync(Base, metaclass=Singleton):
         if raw is None:
             return None
 
-        try:
-            self._checkpoint = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"Corrupt checkpoint value: {raw!r}") from exc
+        if self.is_mysql_compat:
+            parts: list[str] = [p.strip() for p in raw.split(",")]
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Corrupt checkpoint value (expected 'log_file,log_pos'): {raw!r}"
+                )
+
+            log_file, pos = parts
+            if not log_file:
+                raise ValueError("Corrupt checkpoint value: empty log file.")
+
+            try:
+                log_pos = int(pos)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Corrupt checkpoint value: non-integer log position {pos!r}"
+                ) from exc
+
+            if log_pos < 0:
+                raise ValueError(
+                    f"Corrupt checkpoint value: negative log position {log_pos}"
+                )
+
+            self._checkpoint = f"{log_file},{log_pos}"
+
+        else:
+            try:
+                self._checkpoint = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"Corrupt checkpoint value: {raw!r}") from exc
 
         return self._checkpoint
 
     @checkpoint.setter
-    def checkpoint(self, value: t.Optional[str] = None) -> None:
+    def checkpoint(self, value: t.Union[str, int]) -> None:
         """
         Sets the checkpoint value.
 
@@ -1111,15 +1613,37 @@ class Sync(Base, metaclass=Singleton):
         if settings.REDIS_CHECKPOINT:
             self.redis.set_meta({"checkpoint": value})
         else:
-            Path(self._checkpoint_file).write_text(
+            Path(self.checkpoint_file).write_text(
                 f"{value}\n", encoding="utf-8"
             )
 
         # Update in-memory cache last
         self._checkpoint = value
 
+    @property
+    def txid_current(self) -> int:
+        """
+        Get last committed transaction id from the database or redis/valkey.
+        """
+        # If we are in read-only mode, we can only get the txid from Redis/Valkey
+        if getattr(self._thread_local, "read_only", False):
+            return self.redis.get_meta(default={}).get("txid_current", 0)
+        # If we are not in read-only mode, we can get the txid from the database
+        return super().txid_current
+
     def _poll_redis(self) -> None:
-        payloads: list = self.redis.pop()
+        """
+        NB: this is only called by consumer thread
+        """
+        payloads: list
+        if getattr(self._thread_local, "read_only", False):
+            # pg_visible_in_snapshot() to get the closure
+            payloads = self.redis.pop_visible_in_snapshot(
+                self.pg_visible_in_snapshot
+            )
+        else:
+            payloads = self.redis.pop()
+
         if payloads:
             logger.debug(f"_poll_redis: {payloads}")
             with self.lock:
@@ -1133,7 +1657,11 @@ class Sync(Base, metaclass=Singleton):
     @threaded
     @exception
     def poll_redis(self) -> None:
-        """Consumer which polls Redis continuously."""
+        """Consumer which polls Redis/Valkey continuously."""
+        if settings.PG_HOST_RO or settings.PG_PORT_RO:
+            logger.info("Setting read only consumer")
+            self._thread_local.read_only = True
+
         while True:
             self._poll_redis()
 
@@ -1150,7 +1678,7 @@ class Sync(Base, metaclass=Singleton):
 
     @exception
     async def async_poll_redis(self) -> None:
-        """Consumer which polls Redis continuously."""
+        """Consumer which polls Redis/Valkey continuously."""
         while True:
             await self._async_poll_redis()
 
@@ -1206,9 +1734,9 @@ class Sync(Base, metaclass=Singleton):
                         )
                         continue
                     if (
-                        payload["indices"]
-                        and self.index in payload["indices"]
-                        and payload["schema"] in self.tree.schemas
+                        payload.get("indices")
+                        and self.index in payload.get("indices", [])
+                        and payload.get("schema") in self.tree.schemas
                     ):
                         payloads.append(payload)
                         logger.debug(f"poll_db: {payload}")
@@ -1231,21 +1759,30 @@ class Sync(Base, metaclass=Singleton):
         while self.conn.notifies:
             notification: t.AnyStr = self.conn.notifies.pop(0)
             if notification.channel == self.database:
-                payload = json.loads(notification.payload)
+                try:
+                    payload = json.loads(notification.payload)
+                except json.JSONDecodeError as e:
+                    logger.exception(
+                        f"Error decoding JSON payload: {e}\n"
+                        f"Payload: {notification.payload}"
+                    )
+                    continue
                 if (
-                    payload["indices"]
-                    and self.index in payload["indices"]
-                    and payload["schema"] in self.tree.schemas
+                    payload.get("indices")
+                    and self.index in payload.get("indices", [])
+                    and payload.get("schema") in self.tree.schemas
                 ):
                     self.redis.push([payload])
                     logger.debug(f"async_poll: {payload}")
                     self.count["db"] += 1
 
     def refresh_views(self) -> None:
-        self._refresh_views()
+        if not self.is_mysql_compat:
+            self._refresh_views()
 
     async def async_refresh_views(self) -> None:
-        self._refresh_views()
+        if not self.is_mysql_compat:
+            self._refresh_views()
 
     def _refresh_views(self) -> None:
         for node in self.tree.traverse_breadth_first():
@@ -1261,18 +1798,23 @@ class Sync(Base, metaclass=Singleton):
 
     def _on_publish(self, payloads: t.List[Payload]) -> None:
         """
-        Redis publish event handler.
+        Redis/Valkey publish event handler.
 
         This is triggered by poll_redis.
-        It is called when an event is received from Redis.
-        Deserialize the payload from Redis and sync to Elasticsearch/OpenSearch
+        It is called when an event is received from Redis/Valkey.
+        Deserialize the payload from Redis/Valkey and sync to Elasticsearch/OpenSearch
         """
         # this is used for the views.
         # we substitute the views for the base table here
+        # Build lookup table once for O(1) access instead of O(n²) nested loops
+        base_table_to_node: dict = {}
+        for node in self.tree.traverse_breadth_first():
+            for base_table in node.base_tables:
+                base_table_to_node[base_table] = node
+
         for i, payload in enumerate(payloads):
-            for node in self.tree.traverse_breadth_first():
-                if payload.table in node.base_tables:
-                    payloads[i].table = node.table
+            if payload.table in base_table_to_node:
+                payloads[i].table = base_table_to_node[payload.table].table
 
         logger.debug(f"on_publish len {len(payloads)}")
         # Safe inserts are insert operations that can be performed in any order
@@ -1300,7 +1842,8 @@ class Sync(Base, metaclass=Singleton):
                         or payload.table != payload2.table
                     ):
                         self.search_client.bulk(
-                            self.index, self._payloads(_payloads)
+                            self.index,
+                            self._payloads(_payloads),
                         )
                         _payloads = []
                 elif j == len(payloads):
@@ -1316,34 +1859,151 @@ class Sync(Base, metaclass=Singleton):
 
     def pull(self, polling: bool = False) -> None:
         """Pull data from db."""
-        txmin: int = self.checkpoint
-        txmax: int = self.txid_current
-        # this is the max lsn we should go upto
-        upto_lsn: str = self.current_wal_lsn
-        upto_nchanges: int = settings.LOGICAL_SLOT_CHUNK_SIZE
+        txmin: t.Optional[int] = None
+        txmax: t.Optional[int] = None
+        chunk_size: int = settings.LOGICAL_SLOT_CHUNK_SIZE
 
-        logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
+        if self.is_mysql_compat:
+            start_log: t.Optional[str] = None
+            start_pos: t.Optional[int] = None
+            if self.checkpoint:
+                start_log, start_pos = [
+                    p.strip() for p in self.checkpoint.split(",")
+                ]
+            logger.debug(
+                f"pull start_log: {start_log} - start_pos: {start_pos}"
+            )
+        else:
+            txmin = self.checkpoint
+            txmax = self.txid_current
+            logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
+
         # forward pass sync
         self.search_client.bulk(
             self.index, self.sync(txmin=txmin, txmax=txmax)
         )
 
-        try:
-            # now sync up to txmax to capture everything we may have missed
-            self.logical_slot_changes(
-                txmin=txmin,
-                txmax=txmax,
-                upto_nchanges=upto_nchanges,
-                upto_lsn=upto_lsn,
+        if self.is_mysql_compat:
+            self.binlog_changes(
+                start_log=start_log,
+                start_pos=start_pos,
+                binlog_chunk_size=chunk_size,
             )
-        except Exception as e:
-            # if we are polling, we can just continue
-            if polling:
-                return
-            else:
-                raise
-        self.checkpoint: int = txmax or self.txid_current
+        else:
+            # this is the max lsn we should go upto
+            upto_lsn: str = self.current_wal_lsn
+            try:
+                # now sync up to txmax to capture everything we may have missed
+                self.logical_slot_changes(
+                    txmin=txmin,
+                    txmax=txmax,
+                    logical_slot_chunk_size=chunk_size,
+                    upto_lsn=upto_lsn,
+                )
+            except Exception:
+                # if we are polling, we can just continue
+                if polling:
+                    return
+                else:
+                    raise
+
         self._truncate = True
+
+    def _flush_buffer(
+        self,
+        cursor: t.Any,
+        flush_lsn: t.Optional[str] = None,
+        force_ack: bool = False,
+    ) -> None:
+        # If we have buffered docs, send them
+        if self._buffer:
+            logger.info(f"flushing buffer with {len(self._buffer)} docs")
+            docs: list = []
+            for (op, tbl), run in groupby(
+                self._buffer,
+                key=lambda payload: (payload.tg_op, payload.table),
+            ):
+                batch: list = list(run)
+                logger.info(f"bulk group op={op} tbl={tbl} size={len(batch)}")
+                docs.extend(self._payloads(batch))
+
+            if docs:
+                processed: int = len(self._buffer)
+                logger.info(f"sending bulk of {len(docs)} docs")
+                self.search_client.bulk(self.index, docs)
+                self.count["xlog"] += processed
+                logger.info(f"sent bulk of {len(docs)} docs")
+
+            # if caller didn't provide a flush_lsn, then fall back to last buffered row
+            if flush_lsn is None:
+                flush_lsn = self._buffer_last_lsn
+
+            # clear buffer after successful bulk
+            self._buffer.clear()
+            self._buffer_last_lsn = None
+
+        # Even if buffer was empty, we may want to ACK a COMMIT LSN
+        if flush_lsn is not None and (force_ack or not self._buffer):
+            cursor.send_feedback(flush_lsn=flush_lsn, force=True)
+            logger.info(f"sent feedback flush_lsn=P{flush_lsn}")
+
+    def consume(self, message: t.Any) -> None:
+        raw: t.Any = message.payload
+        lsn: t.Optional[str] = message.data_start
+        chunk_size: int = settings.LOGICAL_SLOT_CHUNK_SIZE
+
+        logger.debug(f"[LSN {lsn}] {raw}")
+
+        # Handle empty payloads gracefully
+        if not raw or not raw.strip():
+            logger.debug(f"[LSN {lsn}] Empty payload, skipping")
+            return
+
+        match = TX_BOUNDARY_RE.match(raw)
+        if match:
+            kind: str = match.group(1).upper()
+            if kind == "COMMIT":
+                # Flush any buffered docs, and ACK this COMMIT LSN
+                self._flush_buffer(
+                    cursor=message.cursor,
+                    flush_lsn=lsn,
+                    force_ack=True,  # ACK even if buffer empty
+                )
+            # BEGIN/COMMIT don't include rows by themselves
+            return
+
+        # Not BEGIN/COMMIT -> row change
+        try:
+            payload: Payload = self.parse_logical_slot(raw)
+        except Exception:
+            logger.exception(f"Error parsing row: {raw}")
+            raise
+
+        # Filter by schema
+        if payload.schema not in self.tree.schemas:
+            # we still saw this LSN; it will be ACKed at COMMIT
+            return
+
+        # Buffer across transactions
+        self._buffer.append(payload)
+        self._buffer_last_lsn = lsn
+
+        # Flush when big enough
+        if len(self._buffer) >= chunk_size:
+            self._flush_buffer(message.cursor)
+
+    def wal_consumer(self) -> None:
+        # open a replication‐mode connection
+        conn = pg_logical_repl_conn(database=self.database)
+        cursor = conn.cursor()
+        # start streaming; include XIDs so you see BEGIN/COMMIT markers
+        cursor.start_replication(
+            slot_name=self.__name,
+            options={"include-xids": "1", "skip-empty-xacts": "1"},
+            decode=True,  # gets you str instead of bytes
+        )
+        logger.info("Starting logical replication stream (test_decoding)...")
+        cursor.consume_stream(self.consume)
 
     @threaded
     @exception
@@ -1369,6 +2029,7 @@ class Sync(Base, metaclass=Singleton):
     def status(self) -> None:
         while True:
             self._status(label="Sync")
+            self.redis.set_meta({"txid_current": self.txid_current})
             time.sleep(settings.LOG_INTERVAL)
 
     @exception
@@ -1379,12 +2040,16 @@ class Sync(Base, metaclass=Singleton):
 
     def _status(self, label: str) -> None:
         # TODO: indicate if we are processing logical logs or not
+        if self.producer and not self.consumer:
+            label = f"{label} (Producer)"
+        elif self.consumer and not self.producer:
+            label = f"{label} (Consumer)"
         sys.stdout.write(
             f"{label} {self.database}:{self.index} "
-            f"Xlog: [{self.count['xlog']:,}] => "
-            f"Db: [{self.count['db']:,}] => "
-            f"Redis: [{self.redis.qsize:,}] => "
-            f"{self.search_client.name}: [{self.search_client.doc_count:,}]"
+            f"Xlog: [{format_number(self.count['xlog'])}] => "
+            f"Db: [{format_number(self.count['db'])}] => "
+            f"Redis: [{format_number(self.redis.qsize)}] => "
+            f"{self.search_client.name}: [{format_number(self.search_client.doc_count)}]"
             f"...\n"
         )
         sys.stdout.flush()
@@ -1395,9 +2060,9 @@ class Sync(Base, metaclass=Singleton):
 
         NB: pulls as well as receives in order to avoid missing data.
 
-        1. Buffer all ongoing changes from db to Redis.
+        1. Buffer all ongoing changes from db to Redis/Valkey
         2. Pull everything so far and also replay replication logs.
-        3. Consume all changes from Redis.
+        3. Consume all changes from Redis/Valkey.
         """
         if settings.USE_ASYNC:
             self._conn = self.engine.connect().connection
@@ -1413,14 +2078,14 @@ class Sync(Base, metaclass=Singleton):
             ]
 
         else:
-            # sync up to and produce items in the Redis cache
+            # sync up to and produce items in the Redis/Valkey cache
             if self.producer:
                 self.poll_db()
                 # sync up to current transaction_id
                 self.pull()
 
             # start a background worker consumer thread to
-            # poll Redis and populate Elasticsearch/OpenSearch
+            # poll Redis/Valkey and populate Elasticsearch/OpenSearch
             if self.consumer:
                 for _ in range(self.num_workers):
                     self.poll_redis()
@@ -1437,6 +2102,28 @@ class Sync(Base, metaclass=Singleton):
     "-c",
     help="Schema config",
     type=click.Path(exists=True),
+    default=settings.SCHEMA,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["s3_schema_url", "schema_url"],
+)
+@click.option(
+    "--schema_url",
+    help="URL for schema config",
+    type=click.STRING,
+    default=settings.SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "s3_schema_url"],
+)
+@click.option(
+    "--s3_schema_url",
+    help="S3 URL for schema config",
+    type=click.STRING,
+    default=settings.S3_SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "schema_url"],
 )
 @click.option(
     "--daemon",
@@ -1444,7 +2131,7 @@ class Sync(Base, metaclass=Singleton):
     is_flag=True,
     help="Run as a daemon (Incompatible with --polling)",
     cls=MutuallyExclusiveOption,
-    mutually_exclusive=["polling"],
+    mutually_exclusive=["polling", "wal"],
 )
 @click.option(
     "--producer",
@@ -1465,9 +2152,22 @@ class Sync(Base, metaclass=Singleton):
 @click.option(
     "--polling",
     is_flag=True,
+    default=settings.POLLING,
     help="Polling mode (Incompatible with -d)",
     cls=MutuallyExclusiveOption,
-    mutually_exclusive=["daemon"],
+    mutually_exclusive=["daemon", "wal"],
+)
+@click.option(
+    "--wal",
+    "-w",
+    is_flag=True,
+    default=settings.WAL,
+    help="Use WAL for replication",
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=[
+        "daemon",
+        "polling",
+    ],
 )
 @click.option("--host", "-h", help="PG_HOST override")
 @click.option("--password", is_flag=True, help="Prompt for database password")
@@ -1522,8 +2222,17 @@ class Sync(Base, metaclass=Singleton):
     type=int,
     default=settings.NUM_WORKERS,
 )
+@click.option(
+    "--bootstrap",
+    "-b",
+    is_flag=True,
+    default=False,
+    help="Bootstrap the database",
+)
 def main(
     config: str,
+    schema_url: str,
+    s3_schema_url: str,
     daemon: bool,
     host: str,
     password: bool,
@@ -1538,6 +2247,8 @@ def main(
     polling: bool,
     producer: bool,
     consumer: bool,
+    bootstrap: bool,
+    wal: bool,
 ) -> None:
     """Main application syncer."""
     if version:
@@ -1561,9 +2272,24 @@ def main(
         key: value for key, value in kwargs.items() if value is not None
     }
 
-    config: str = get_config(config)
+    if not config and not schema_url and not s3_schema_url:
+        raise click.UsageError(
+            "You must provide either --config (or SCHEMA env var) or "
+            "--schema-url (or SCHEMA_URL env var) or "
+            "--s3-schema-url (or S3_SCHEMA_URL env var)."
+        )
 
-    show_settings(config)
+    validate_config(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    )
+
+    show_settings(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    )
+
+    # MySQL and MariaDB are only supported in polling mode
+    if daemon and IS_MYSQL_COMPAT:
+        polling = True
 
     if producer:
         consumer = False
@@ -1574,7 +2300,11 @@ def main(
 
     with Timer():
         if analyze:
-            for doc in config_loader(config):
+            for doc in config_loader(
+                config=config,
+                schema_url=schema_url,
+                s3_schema_url=s3_schema_url,
+            ):
                 sync: Sync = Sync(doc, verbose=verbose, **kwargs)
                 sync.analyze()
 
@@ -1582,22 +2312,65 @@ def main(
             # In polling mode, the app can run without replication slots or triggers.
             # However, this is not the preferred mode of operation.
             # It should be considered a workaround for running on a read-only cluster.
-            kwargs["polling"] = True
             while True:
-                for doc in config_loader(config):
-                    sync: Sync = Sync(doc, verbose=verbose, **kwargs)
+                for doc in config_loader(
+                    config=config,
+                    schema_url=schema_url,
+                    s3_schema_url=s3_schema_url,
+                ):
+                    sync: Sync = Sync(
+                        doc, verbose=verbose, polling=True, **kwargs
+                    )
                     sync.pull(polling=True)
                 time.sleep(settings.POLL_INTERVAL)
+        elif wal:
+            syncs: t.List[Sync] = []
+            for doc in config_loader(
+                config=config,
+                schema_url=schema_url,
+                s3_schema_url=s3_schema_url,
+            ):
+                sync: Sync = Sync(
+                    doc,
+                    verbose=verbose,
+                    wal=wal,
+                    bootstrap=bootstrap,
+                    **kwargs,
+                )
+                syncs.append(sync)
 
+            # Start additional schema consumers in daemon threads
+            # so all entries in the schema config are processed
+            # concurrently.
+            # Each Sync instance has its own
+            # replication slot and database connection.
+            threads: t.List[threading.Thread] = []
+            for sync in syncs[1:]:
+                thread = threading.Thread(
+                    target=sync.wal_consumer,
+                    daemon=True,
+                )
+                thread.start()
+                threads.append(thread)
+
+            # Run the first consumer on the main thread so that
+            # KeyboardInterrupt is handled naturally.
+            if syncs:
+                syncs[0].wal_consumer()
         else:
             tasks: t.List[asyncio.Task] = []
-            for doc in config_loader(config):
+            for doc in config_loader(
+                config=config,
+                schema_url=schema_url,
+                s3_schema_url=s3_schema_url,
+            ):
                 sync: Sync = Sync(
                     doc,
                     verbose=verbose,
                     num_workers=num_workers,
                     producer=producer,
                     consumer=consumer,
+                    bootstrap=bootstrap,
                     **kwargs,
                 )
                 sync.pull()
@@ -1606,7 +2379,9 @@ def main(
                     tasks.extend(sync.tasks)
 
             if settings.USE_ASYNC:
-                event_loop = asyncio.get_event_loop()
+                event_loop: asyncio.AbstractEventLoop = (
+                    asyncio.get_event_loop()
+                )
                 event_loop.run_until_complete(asyncio.gather(*tasks))
                 event_loop.close()
 

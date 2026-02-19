@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import typing as t
 from datetime import timedelta
@@ -12,24 +13,31 @@ from string import Template
 from time import time
 from urllib.parse import ParseResult, urlparse
 
+import boto3
 import click
+import requests
 import sqlalchemy as sa
 import sqlparse
 
 from . import settings
-from .exc import SchemaError
-from .urls import get_postgres_url, get_redis_url, get_search_url
+from .urls import get_database_url, get_redis_url, get_search_url
 
 logger = logging.getLogger(__name__)
 
 HIGHLIGHT_BEGIN = "\033[4m"
 HIGHLIGHT_END = "\033[0m:"
 
+# Regular expression to match placeholder column names (e.g., "UNKNOWN_COL1") used for remapping
+_UNKNOWN_RE = re.compile(r"^UNKNOWN_COL(\d+)$")
 
-def chunks(value: list, size: int) -> list:
-    """Yield successive n-sized chunks from l"""
-    for i in range(0, len(value), size):
-        yield value[i : i + size]
+# Cache for storing column name mappings for (database, table) pairs, used in MySQL column remapping
+_col_cache: dict[tuple[str, str], list[str]] = {}
+
+
+def chunks(sequence: t.Sequence, size: int) -> t.Iterable[t.Sequence]:
+    """Yield successive n-sized chunks from sequence"""
+    for i in range(0, len(sequence), size):
+        yield sequence[i : i + size]
 
 
 def timeit(func: t.Callable):
@@ -92,40 +100,52 @@ def exception(func: t.Callable):
     return wrapper
 
 
+def format_number(n: int) -> str:
+    """
+    Format a number with commas if the setting is enabled."""
+    return f"{n:,}" if settings.FORMAT_WITH_COMMAS else f"{n}"
+
+
 def get_redacted_url(url: str) -> str:
     """
     Returns a redacted version of the input URL, with the password replaced by asterisks.
     """
     parsed_url: ParseResult = urlparse(url)
     if parsed_url.password:
-        username = parsed_url.username or ""
-        hostname = parsed_url.hostname or ""
-        port = f":{parsed_url.port}" if parsed_url.port else ""
-        redacted_password = "*" * len(parsed_url.password)
+        username: str = parsed_url.username or ""
+        hostname: str = parsed_url.hostname or ""
+        port: str = f":{parsed_url.port}" if parsed_url.port else ""
+        redacted_password: str = "*" * len(parsed_url.password)
         netloc: str = f"{username}:{redacted_password}@{hostname}{port}"
         parsed_url = parsed_url._replace(netloc=netloc)
     return parsed_url.geturl()
 
 
-def show_settings(schema: t.Optional[str] = None) -> None:
+def show_settings(
+    config: t.Optional[str] = None,
+    schema_url: t.Optional[str] = None,
+    s3_schema_url: t.Optional[str] = None,
+) -> None:
     """Show settings."""
     logger.info(f"{HIGHLIGHT_BEGIN}Settings{HIGHLIGHT_END}")
-    logger.info(f'{"Schema":<10s}: {schema or settings.SCHEMA}')
+    logger.info(f'{"Schema":<10s}: {config or schema_url or s3_schema_url}')
     logger.info("-" * 65)
     logger.info(f"{HIGHLIGHT_BEGIN}Checkpoint{HIGHLIGHT_END}")
     logger.info(f"Path: {settings.CHECKPOINT_PATH}")
-    logger.info(f"{HIGHLIGHT_BEGIN}Postgres{HIGHLIGHT_END}")
+    logger.info(f"{HIGHLIGHT_BEGIN}Database{HIGHLIGHT_END}")
 
-    url: str = get_postgres_url("postgres")
+    database: str = (
+        "information_schema" if settings.IS_MYSQL_COMPAT else "postgres"
+    )
+    url: str = get_database_url(database)
     redacted_url: str = get_redacted_url(url)
     logger.info(f"URL: {redacted_url}")
 
     url: str = get_search_url()
     redacted_url: str = get_redacted_url(url)
-    if settings.ELASTICSEARCH:
-        logger.info(f"{HIGHLIGHT_BEGIN}Elasticsearch{HIGHLIGHT_END}")
-    else:
-        logger.info(f"{HIGHLIGHT_BEGIN}OpenSearch{HIGHLIGHT_END}")
+    logger.info(
+        f"{HIGHLIGHT_BEGIN}{'Elasticsearch' if settings.ELASTICSEARCH else 'OpenSearch'}{HIGHLIGHT_END}"
+    )
     logger.info(f"URL: {redacted_url}")
     logger.info(f"{HIGHLIGHT_BEGIN}Redis{HIGHLIGHT_END}")
 
@@ -135,52 +155,149 @@ def show_settings(schema: t.Optional[str] = None) -> None:
     logger.info("-" * 65)
 
     logger.info(f"{HIGHLIGHT_BEGIN}Replication slots{HIGHLIGHT_END}")
-    for doc in config_loader(schema):
-        index: str = doc.get("index") or doc["database"]
-        database: str = doc.get("database", index)
-        slot_name: str = re.sub(
-            "[^0-9a-zA-Z_]+", "", f"{database.lower()}_{index}"
-        )
+    if (
+        config is not None
+        and schema_url is not None
+        and s3_schema_url is not None
+    ):
+        for doc in config_loader(
+            config=config,
+            schema_url=schema_url,
+            s3_schema_url=s3_schema_url,
+        ):
+            index: str = doc.get("index") or doc["database"]
+            database: str = doc.get("database", index)
+            slot_name: str = re.sub(
+                "[^0-9a-zA-Z_]+", "", f"{database.lower()}_{index}"
+            )
         logger.info(f"Slot: {slot_name}")
 
     logger.info("-" * 65)
 
 
-def get_config(config: t.Optional[str] = None) -> str:
-    """Return the schema config for PGSync."""
-    config = config or settings.SCHEMA
-    if not config:
-        raise SchemaError(
-            "Schema config not set\n. "
-            "Set env SCHEMA=/path/to/schema.json or "
-            "provide args --config /path/to/schema.json"
+def validate_config(
+    config: t.Optional[str] = None,
+    schema_url: t.Optional[str] = None,
+    s3_schema_url: t.Optional[str] = None,
+) -> str:
+    """Ensure there is a valid schema config."""
+
+    if config:
+        if not os.path.exists(config):
+            raise FileNotFoundError(f'Schema config "{config}" not found')
+
+    if schema_url:
+        parsed: ParseResult = urlparse(schema_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f'Invalid URL: "{schema_url}"')
+
+    if s3_schema_url:
+        if not s3_schema_url.startswith("s3://"):
+            raise ValueError(f'Invalid S3 URL: "{s3_schema_url}"')
+
+    if not config and not schema_url and not s3_schema_url:
+        raise ValueError(
+            "You must provide either a local config path, a valid URL or an S3 URL"
         )
-    if not os.path.exists(config):
-        raise FileNotFoundError(f'Schema config "{config}" not found')
-    return config
 
 
-def config_loader(config: str) -> t.Generator:
+def config_loader(
+    config: t.Optional[str] = None,
+    schema_url: t.Optional[str] = None,
+    s3_schema_url: t.Optional[str] = None,
+) -> t.Generator[dict, None, None]:
     """
-    Loads a configuration file and yields each document in the file as a dictionary.
-    The values in the dictionary are processed as templates, with environment variables
-    substituted for placeholders. If a value cannot be processed as a template, it is
-    left unchanged.
-
-    Args:
-        config (str): The path to the configuration file.
-
-    Yields:
-        dict: A dictionary representing a document in the configuration file.
+    Loads a configuration file from a local path or S3 URL or URL and yields each document.
     """
-    with open(config, "r") as docs:
-        for doc in json.load(docs):
-            for key, value in doc.items():
-                try:
-                    doc[key] = Template(value).safe_substitute(os.environ)
-                except TypeError:
-                    pass
-            yield doc
+
+    def is_s3_url(url: str) -> bool:
+        return url.lower().startswith("s3://")
+
+    def download_from_s3(s3_url: str) -> str:
+        parsed = urlparse(s3_url)
+        if not parsed.netloc or not parsed.path:
+            raise ValueError(f"Invalid S3 URL: {s3_url}")
+        bucket: str = parsed.netloc
+        key: str = parsed.path.lstrip("/")
+        s3: boto3.client = boto3.client("s3")
+        temp_file: tempfile.NamedTemporaryFile = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".json"
+        )
+        s3.download_file(bucket, key, temp_file.name)
+        return temp_file.name
+
+    def is_url(url: str) -> bool:
+        parsed_url: ParseResult = urlparse(url)
+        return parsed_url.scheme in ("http", "https")
+
+    def download_from_url(url: str) -> str:
+        """Download JSON from a URL, save to a temp .json file, and return its path."""
+        response: requests.Response = requests.get(
+            url, headers={"Accept": "application/json"}, timeout=(10, 60)
+        )
+        response.raise_for_status()
+        # Ensure it's valid JSON (raises ValueError if not)
+        try:
+            data: dict = response.json()
+        except ValueError as e:
+            content_type = response.headers.get("Content-Type", "unknown")
+            raise ValueError(
+                f"Expected JSON from {url} (got Content-Type: {content_type})"
+            ) from e
+
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+            return path
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+
+    if not config and not schema_url and not s3_schema_url:
+        raise ValueError(
+            "You must provide either a local config path, a valid URL or an S3 URL"
+        )
+
+    config_path: str = None
+    is_temp_file: bool = False
+
+    if config:
+        if not os.path.exists(config):
+            raise FileNotFoundError(f'Local config "{config}" not found')
+        config_path = config
+    elif schema_url and is_url(schema_url):
+        config_path = download_from_url(schema_url)
+        is_temp_file = True
+    elif s3_schema_url and is_s3_url(s3_schema_url):
+        config_path = download_from_s3(s3_schema_url)
+        is_temp_file = True
+    else:
+        raise ValueError(
+            "Invalid input: schema must be a file path, a valid S3 URL or a valid URL."
+        )
+
+    try:
+        with open(config_path, "r") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{config_path} is not valid JSON: {e}"
+                ) from e
+            for doc in data:
+                for key, value in doc.items():
+                    try:
+                        doc[key] = Template(value).safe_substitute(os.environ)
+                    except TypeError:
+                        pass
+                yield doc
+    finally:
+        if is_temp_file and os.path.exists(config_path):
+            os.remove(config_path)
 
 
 def compiled_query(
@@ -255,3 +372,53 @@ class MutuallyExclusiveOption(click.Option):
         return super(MutuallyExclusiveOption, self).handle_parse_result(
             ctx, opts, args
         )
+
+
+def qname(engine_or_conn, schema: str = None, table: str = None) -> str:
+    """
+    Return a dialect-correct, quoted table name.
+
+    Examples:
+    Postgres:  qname(engine, "public", "users")  ->  "public"."users"
+    MySQL:     qname(engine, "mydb",  "users")   ->  `mydb`.`users`
+                (or just `users` if schema is None)
+    """
+    dialect = getattr(engine_or_conn, "dialect", engine_or_conn.engine.dialect)
+    quote = dialect.identifier_preparer.quote_identifier
+
+    if schema and schema.strip():
+        return f"{quote(schema)}.{quote(table)}"
+    return quote(table)
+
+
+# mysql related helper methods
+def _cols(engine: sa.Engine, schema: str, table: str) -> list[str]:
+    key = (schema, table)
+    if key in _col_cache:
+        return _col_cache[key]
+    insp = sa.inspect(engine)
+    cols = [c["name"] for c in insp.get_columns(table, schema=schema)]
+    _col_cache[key] = cols
+    return cols
+
+
+def remap_unknown(
+    engine: sa.Engine, schema: str, table: str, values: dict
+) -> dict:
+    if not values:
+        return values
+    # only remap if *all* keys are UNKNOWN_COL*
+    if not all(
+        isinstance(k, str) and _UNKNOWN_RE.match(k) for k in values.keys()
+    ):
+        return values
+    cols = _cols(engine, schema, table)
+    remapped: dict = {}
+    # keys may be 0-based (UNKNOWN_COL0), so use the numeric suffix
+    for k, v in values.items():
+        idx = int(_UNKNOWN_RE.match(k).group(1))  # type: ignore
+        if idx < len(cols):
+            remapped[cols[idx]] = v
+        else:
+            remapped[f"@{idx+1}"] = v  # fallback
+    return remapped

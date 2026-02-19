@@ -3,15 +3,14 @@
 import pytest
 from mock import MagicMock, patch
 
-from pgsync.exc import SchemaError
-from pgsync.settings import ELASTICSEARCH_PORT
+from pgsync.settings import ELASTICSEARCH_PORT, IS_MYSQL_COMPAT
 from pgsync.urls import (
     _get_auth,
-    get_postgres_url,
+    get_database_url,
     get_redis_url,
     get_search_url,
 )
-from pgsync.utils import get_config
+from pgsync.utils import validate_config
 
 
 @pytest.mark.usefixtures("table_creator")
@@ -42,18 +41,25 @@ class TestUrls(object):
         )
         assert mock_logger.debug.call_count == 3
 
-    def test_get_postgres_url(self):
-        url = get_postgres_url("mydb")
-        assert url.endswith("@localhost:5432/mydb")
-        assert (
-            get_postgres_url("mydb", user="kermit", password="12345")
-            == "postgresql+psycopg2://kermit:12345@localhost:5432/mydb"
-        )
-        url = get_postgres_url("mydb", port=9999)
+    def test_get_database_url(self):
+        url = get_database_url("mydb")
+        if IS_MYSQL_COMPAT:
+            assert url.endswith("@localhost:3306/mydb")
+            assert (
+                get_database_url("mydb", user="kermit", password="12345")
+                == "mysql+pymysql://kermit:12345@localhost:3306/mydb"
+            )
+        else:
+            assert url.endswith("@localhost:5432/mydb")
+            assert (
+                get_database_url("mydb", user="kermit", password="12345")
+                == "postgresql+psycopg2://kermit:12345@localhost:5432/mydb"
+            )
+        url = get_database_url("mydb", port=9999)
         assert url.endswith("@localhost:9999/mydb")
         # with patch("pgsync.urls.logger") as mock_logger:
         #     assert (
-        #         get_postgres_url("mydb", user="kermit")
+        #         get_database_url("mydb", user="kermit")
         #         == "postgresql+psycopg2://kermit@localhost:5432/mydb"
         #     )
         #     mock_logger.debug.assert_called_once_with(
@@ -94,20 +100,27 @@ class TestUrls(object):
         )
 
     @patch("pgsync.urls.logger")
-    def test_get_config(self, mock_logger):
-        assert __file__ == get_config(config=__file__)
-        with pytest.raises(SchemaError) as excinfo:
-            get_config()
-        assert "Schema config not set" in str(excinfo.value)
-        with pytest.raises(IOError) as excinfo:
-            get_config("/tmp/nonexistent")
+    def test_validate_config_with_mock_logger(self, mock_logger):
+        # Valid file path should not raise (uses current file)
+        validate_config(config=__file__)
+
+        # Missing all config, url and s3_schema_url -> ValueError
+        with pytest.raises(ValueError) as excinfo:
+            validate_config()
+        assert (
+            "You must provide either a local config path, a valid URL or an S3 URL"
+            in str(excinfo.value)
+        )
+
+        # Non-existent file -> FileNotFoundError
+        with pytest.raises(FileNotFoundError) as excinfo:
+            validate_config(config="/tmp/nonexistent")
         assert 'Schema config "/tmp/nonexistent" not found' in str(
             excinfo.value
         )
 
     @patch("pgsync.urls.logger")
     def test_get_auth(self, mock_logger):
-        assert __file__ == get_config(config=__file__)
         with patch("pgsync.urls.Plugins", return_value=MagicMock()):
             _get_auth("something")
             mock_logger.assert_not_called()
