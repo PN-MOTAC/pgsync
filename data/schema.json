@@ -2,7 +2,10 @@
   {
     "database": "api-dev",
     "index": "motac_destinations",
-    "plugins": ["GeoPoint"],
+    "plugins": [
+      "GeoPoint",
+      "GenericFilterPlugin"
+    ],
     "nodes": {
       "table": "destination",
       "schema": "public",
@@ -111,7 +114,7 @@
           "table": "destination_recommendation_tag",
           "schema": "public",
           "columns": [
-              "id"
+            "id"
           ],
           "relationship": {
             "variant": "object",
@@ -156,7 +159,9 @@
   {
     "database": "api-dev",
     "index": "motac_restaurants",
-    "plugins": ["GeoPoint"],
+    "plugins": [
+      "GeoPoint"
+    ],
     "nodes": {
       "table": "restaurant_branch",
       "schema": "public",
@@ -281,7 +286,7 @@
           "table": "restaurant_branch_tag_pivot",
           "schema": "public",
           "columns": [
-              "id"
+            "id"
           ],
           "relationship": {
             "variant": "object",
@@ -379,13 +384,13 @@
             "variant": "object",
             "type": "one_to_one"
           },
-          "children":[
+          "children": [
             {
               "table": "trip_destination",
               "schema": "public",
               "columns": [
-                  "destination_id",
-                  "trip_day_id"
+                "destination_id",
+                "trip_day_id"
               ],
               "relationship": {
                 "variant": "object",
