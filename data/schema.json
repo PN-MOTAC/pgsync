@@ -6,6 +6,10 @@
       "GeoPoint",
       "GenericFilterPlugin"
     ],
+    "filter": {
+      "field": "status",
+      "value": "Active"
+    },
     "nodes": {
       "table": "destination",
       "schema": "public",
