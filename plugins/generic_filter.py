@@ -92,6 +92,8 @@ class GenericFilterPlugin(plugin.Plugin):
             if field in doc:
                 value = doc[field]
                 # If value doesn't match, drop the document
+                # Note: This performs strict type comparison (e.g. 100 != "100").
+                # Ensure schema value type matches document field type (e.g. use integers for integer fields).
                 if value != expected_value:
                     return None
         
