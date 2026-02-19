@@ -8,9 +8,9 @@ ENV EXAMPLE_NAME=$EXAMPLE_NAME
 RUN mkdir -p "$WORKDIR"
 WORKDIR "$WORKDIR"
 
-# Install git (required for pip install from git+ URL)
+# Install git and curl (required for pip install from git+ URL and schema download)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends git curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy project files
