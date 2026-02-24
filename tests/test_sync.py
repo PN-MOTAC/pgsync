@@ -2117,11 +2117,11 @@ class TestWALStreaming:
         assert call_kwargs["decode"] is True
         assert "include-xids" in call_kwargs["options"]
 
+    @patch("pgsync.sync.validate_config")
     @patch("pgsync.sync.config_loader")
     @patch("pgsync.sync.Sync")
-    @patch("pgsync.sync.wal_consumer")
     def test_main_wal_multiple_schemas_spawns_threads(
-        self, mock_wal_consumer, MockSync, mock_config_loader
+        self, MockSync, mock_config_loader, mock_validate_config
     ):
         """Test that WAL mode spawns threads for multiple schema entries."""
         import threading
@@ -2146,28 +2146,26 @@ class TestWALStreaming:
             started_threads.append(self_thread)
             self_thread.run()
 
-        # Patch threading.Thread.start to capture threads and run them synchronously
-        with patch.object(threading.Thread, "start", side_effect=_record_start, autospec=True):
+        with patch.object(threading.Thread, "start", _record_start):
             runner = CliRunner()
             result = runner.invoke(main, ["--wal", "-c", "schema.json"])
 
-        # assert result.exit_code == 0
-        
-        # Verify wal_consumer was called 3 times (once per document)
-        assert mock_wal_consumer.call_count == 3
-        
-        # Verify that wal_consumer was called with the correct arguments (sync instances)
-        # We can optionally check arguments if needed, but call count is the primary failure
-        # calls = [call(s) for s in sync_instances]
-        # mock_wal_consumer.assert_has_calls(calls, any_order=True)
+        # Debugging: check if main failed unexpectedly
+        if result.exit_code != 0:
+            print(f"CLI ran into an error: {result.exception}", flush=True)
+
+        # All three consumers should have been called
+        for s in sync_instances:
+            s.wal_consumer.assert_called_once()
 
         # Two extra threads for the 2nd and 3rd schemas
         assert len(started_threads) == 2
 
+    @patch("pgsync.sync.validate_config")
     @patch("pgsync.sync.config_loader")
     @patch("pgsync.sync.Sync")
     def test_main_wal_single_schema_no_threads(
-        self, MockSync, mock_config_loader
+        self, MockSync, mock_config_loader, mock_validate_config
     ):
         """Test that a single schema entry doesn't spawn extra threads."""
         import threading
