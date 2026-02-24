@@ -245,9 +245,10 @@ class Sync(Base, metaclass=Singleton):
                 if set(MATERIALIZED_VIEW_COLUMNS) != set(
                     self.columns(node.schema, MATERIALIZED_VIEW)
                 ):
-                    raise RuntimeError(
+                    logger.warning(
                         f"Required materialized view columns not present on "
-                        f"{MATERIALIZED_VIEW}. Please re-run bootstrap."
+                        f"{MATERIALIZED_VIEW}. This indicates an outdated view. "
+                        f"Bootstrap will recreate it."
                     )
 
             if node.schema not in self.schemas:
