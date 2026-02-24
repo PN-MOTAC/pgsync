@@ -2148,7 +2148,10 @@ class TestWALStreaming:
 
         with patch.object(threading.Thread, "start", _record_start):
             runner = CliRunner()
-            result = runner.invoke(main, ["--wal", "-c", "schema.json"])
+            with runner.isolated_filesystem():
+                with open("schema.json", "w") as f:
+                    f.write("[]")
+                result = runner.invoke(main, ["--wal", "-c", "schema.json"])
 
         # Debugging: check if main failed unexpectedly
         if result.exit_code != 0:
@@ -2189,7 +2192,10 @@ class TestWALStreaming:
 
         with patch.object(threading.Thread, "start", _record_start):
             runner = CliRunner()
-            result = runner.invoke(main, ["--wal", "-c", "schema.json"])
+            with runner.isolated_filesystem():
+                with open("schema.json", "w") as f:
+                    f.write("[]")
+                result = runner.invoke(main, ["--wal", "-c", "schema.json"])
 
         sync_instance.wal_consumer.assert_called_once()
         assert len(started_threads) == 0
