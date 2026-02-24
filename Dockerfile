@@ -21,8 +21,11 @@ COPY ./docker/runserver.sh ./runserver.sh
 # Copy plugins directory into the container
 COPY ./plugins $WORKDIR/plugins
 
-# Install pgsync from GitHub
-RUN pip install --no-cache-dir git+https://github.com/toluaina/pgsync.git
+# Copy the entire project for local installation
+COPY . $WORKDIR/
+
+# Install pgsync from local source
+RUN pip install --no-cache-dir .
 
 # Make scripts executable
 RUN chmod +x wait-for-it.sh runserver.sh
