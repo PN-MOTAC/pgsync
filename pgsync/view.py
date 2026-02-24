@@ -384,17 +384,18 @@ def create_view(
 
     rows: dict = {}
     if MATERIALIZED_VIEW in views:
-        for (
-            table_name,
-            primary_keys,
-            foreign_keys,
-            indices,
-            columns,
-        ) in fetchall(
+        for row in fetchall(
             sa.select("*").select_from(
                 sa.text(f"{schema}.{MATERIALIZED_VIEW}")
             )
         ):
+            if len(row) == 4:
+                table_name, primary_keys, foreign_keys, indices = row
+                columns = None
+            elif len(row) >= 5:
+                table_name, primary_keys, foreign_keys, indices, columns = row[:5]
+            else:
+                continue
             rows.setdefault(
                 table_name,
                 {
