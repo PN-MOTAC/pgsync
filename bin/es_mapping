@@ -1,14 +1,26 @@
 #!/usr/bin/env python
 
 """Create a custom NGram analyzer for the default mapping."""
+
 import logging
 
 import click
 from elasticsearch import Elasticsearch, helpers
 
-from pgsync.settings import ELASTICSEARCH_TIMEOUT, ELASTICSEARCH_VERIFY_CERTS
+from pgsync.settings import (
+    ELASTICSEARCH_TIMEOUT,
+    ELASTICSEARCH_VERIFY_CERTS,
+    S3_SCHEMA_URL,
+    SCHEMA,
+    SCHEMA_URL,
+)
 from pgsync.urls import get_search_url
-from pgsync.utils import config_loader, get_config, timeit
+from pgsync.utils import (
+    config_loader,
+    MutuallyExclusiveOption,
+    timeit,
+    validate_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +121,45 @@ def create_es_mapping(index: str) -> None:
     "-c",
     help="Schema config",
     type=click.Path(exists=True),
+    default=SCHEMA,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["s3_schema_url", "schema_url"],
 )
-def main(config: str) -> None:
+@click.option(
+    "--schema_url",
+    help="URL for schema config",
+    type=click.STRING,
+    default=SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "s3_schema_url"],
+)
+@click.option(
+    "--s3_schema_url",
+    help="S3 URL for schema config",
+    type=click.STRING,
+    default=S3_SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "schema_url"],
+)
+def main(config: str, schema_url: str, s3_schema_url: str) -> None:
     """Create custom NGram analyzer for the default mapping."""
 
-    config: str = get_config(config)
-    for index in set([doc["index"] for doc in config_loader(config)]):
+    validate_config(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    )
+    for index in set(
+        [
+            doc["index"]
+            for doc in config_loader(
+                config=config,
+                schema_url=schema_url,
+                s3_schema_url=s3_schema_url,
+            )
+        ]
+    ):
         create_es_mapping(index)
 
 

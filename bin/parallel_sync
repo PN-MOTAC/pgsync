@@ -1,44 +1,37 @@
 #!/usr/bin/env python
 
 """
-Parallel sync is an innovative, experimental feature designed to optimize
-throughput by utilizing available CPUs/threads, particularly beneficial
-in environments experiencing high network latency.
+Parallel sync optimizes throughput by utilizing available CPUs/threads,
+particularly in environments with high network latency.
 
 Scenario & Challenge:
-In instances where your PG database, Elasticsearch/OpenSearch, and PGSync
-servers operate on divergent networks, a delay in request/response time is
-noticeable. The primary constraint emerges from the database query's roundtrip,
-which even server-side cursors can address only to a limited extent by fetching
-a certain number of records at a time. The consequent delay in fetching the
-next cursor significantly hampers the overall synchronization speed.
+When your PostgreSQL database, Elasticsearch/OpenSearch, and PGSync servers
+are on different networks, request/response latency becomes significant.
+The main bottleneck is the database query roundtrip time. Server-side cursors
+help by fetching batches of records, but the delay between cursor fetches
+still limits overall synchronization speed.
 
 Solution:
-To mitigate this, the strategy is to conduct an initial fast/parallel sync,
-thereby populating Elasticsearch/OpenSearch in a single iteration.
-Post this, the regular pgsync can continue running as a daemon.
+Perform an initial fast parallel sync to populate Elasticsearch/OpenSearch
+in one pass. After this, regular pgsync can continue running as a daemon.
 
-Approach and Technical Implementation:
-The approach centers around utilizing the Tuple identifier record of the table
-columns. Every table incorporates a system column – "ctid" of type "tid,"
-which helps identify the page record and the row number in each block.
-This element facilitates the pagination of the sync process.
+Technical Approach:
+This implementation uses PostgreSQL's tuple identifier system column "ctid"
+(type "tid"), which identifies the page and row number of each record.
+The ctid is a tuple like (1, 5), indicating the disk page and row position.
 
-Technically, pagination implies dividing each paged record amongst the
-available CPUs/threads. This division enables the parallel execution of
-Elasticsearch/OpenSearch bulk inserts. The "ctid" serves as a tuple
-(for instance, (1, 5)), pinpointing the row in a disk page.
+The sync process works as follows:
+1. Retrieve all ctid values from the root table upfront
+2. Divide records into work units based on BLOCK_SIZE (number of root node
+   records per worker)
+3. Distribute work units across available CPUs/threads
+4. Workers execute queries filtered by page and row numbers in parallel
+5. Each worker performs bulk inserts to Elasticsearch/OpenSearch
 
-By leveraging this method, all paged row records are retrieved upfront and
-allocated as work units across the worker threads/CPUs.
-Each work unit, defined by the BLOCK_SIZE, denotes the number of root node
-records assigned for each worker to process.
-
-Subsequently, the workers execute queries for each assigned chunk of work,
-filtered based on the page number and row numbers.
-This systematic and parallel approach optimizes the synchronization process,
-especially in environments challenged by network latency.
+This parallel approach significantly improves synchronization performance,
+especially in high-latency network environments.
 """
+
 import asyncio
 import multiprocessing
 import os
@@ -47,16 +40,27 @@ import sys
 import typing as t
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from queue import Queue
 from threading import Thread
 
 import click
 import sqlalchemy as sa
 
-from pgsync.settings import BLOCK_SIZE, CHECKPOINT_PATH
+from pgsync.settings import (
+    BLOCK_SIZE,
+    CHECKPOINT_PATH,
+    S3_SCHEMA_URL,
+    SCHEMA,
+    SCHEMA_URL,
+)
 from pgsync.sync import Sync
-from pgsync.utils import config_loader, get_config, show_settings, timeit
+from pgsync.utils import (
+    config_loader,
+    MutuallyExclusiveOption,
+    show_settings,
+    timeit,
+    validate_config,
+)
 
 
 def save_ctid(page: int, row: int, filename: str) -> None:
@@ -101,7 +105,7 @@ def logical_slot_changes(
     txmin: int = sync.checkpoint
     txmax: int = sync.txid_current
     sync.logical_slot_changes(txmin=txmin, txmax=txmax)
-    sync.checkpoint: int = txmax or sync.txid_current
+    sync.checkpoint = txmax or sync.txid_current
 
 
 @dataclass
@@ -378,6 +382,28 @@ def run_task(
     "-c",
     help="Schema config",
     type=click.Path(exists=True),
+    default=SCHEMA,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["s3_schema_url", "schema_url"],
+)
+@click.option(
+    "--schema_url",
+    help="URL for schema config",
+    type=click.STRING,
+    default=SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "s3_schema_url"],
+)
+@click.option(
+    "--s3_schema_url",
+    help="S3 URL for schema config",
+    type=click.STRING,
+    default=S3_SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "schema_url"],
 )
 @click.option(
     "--verbose",
@@ -409,17 +435,31 @@ def run_task(
     ),
     default="multiprocess_async",
 )
-def main(config: str, nprocs: int, mode: str, verbose: bool) -> None:
+def main(
+    config: str,
+    schema_url: str,
+    s3_schema_url: str,
+    nprocs: int,
+    mode: str,
+    verbose: bool,
+) -> None:
     """
     TODO:
     - Track progress across cpus/threads
     - Handle KeyboardInterrupt Exception
     """
 
-    show_settings()
-    config: str = get_config(config)
+    validate_config(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    )
 
-    for doc in config_loader(config):
+    show_settings(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    )
+
+    for doc in config_loader(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    ):
         tasks: t.Generator = fetch_tasks(doc)
         if mode == "synchronous":
             synchronous(tasks, doc, verbose=verbose)
